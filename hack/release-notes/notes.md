@@ -1,4 +1,4 @@
-# <img src="https://github.com/${REPO}/raw/${TAG}/docs/images/logos/trickster-logo.svg" width=60 />&nbsp;&nbsp;&nbsp;&nbsp;<img src="https://github.com/${REPO}/raw/${TAG}/docs/images/logos/trickster-text.svg" width=280 />
+# <img src="https://github.com/${REPO}/raw/v${TAG}/docs/images/logos/trickster-logo.svg" width=60 />&nbsp;&nbsp;&nbsp;&nbsp;<img src="https://github.com/${REPO}/raw/v${TAG}/docs/images/logos/trickster-text.svg" width=280 />
 
 Welcome to Trickster ${TAG}! :tada:
 
@@ -37,5 +37,5 @@ Note:
 ---
 
 For **more information**, see:
-* [Trying Out Trickster](https://github.com/${REPO}/tree/${TAG}#trying-out-trickster)
+* [Trying Out Trickster](https://github.com/${REPO}/tree/v${TAG}#trying-out-trickster)
 * trickster's [helm chart](https://github.com/trickstercache/helm-charts).
