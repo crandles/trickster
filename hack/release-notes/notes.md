@@ -24,10 +24,18 @@ docker run --name trickster -d -v /path/to/trickster.yaml:/etc/trickster/trickst
 <summary>Run via kubernetes/helm</summary>
 
 ```bash
-helm install trickster oci://ghcr.io/trickstercache/charts/trickster --version ${TAG}
+helm install trickster oci://ghcr.io/trickstercache/charts/trickster --version '^2' --set image.tag="${TAG}"
 ```
+
+Note:
+
+* The trickster chart version is managed separately from the Trickster version.
+* The latest major version is 2.x, and supports a minimum Trickster version of 2.0.0 (beta3 or later).
+
 </details>
 
-For more information, see:
+---
+
+For **more information**, see:
 * [Trying Out Trickster](https://github.com/${REPO}/tree/${TAG}#trying-out-trickster)
 * trickster's [helm chart](https://github.com/trickstercache/helm-charts).
