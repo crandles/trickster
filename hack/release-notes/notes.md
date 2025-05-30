@@ -1,3 +1,5 @@
+# <img src="https://github.com/trickstercache/trickster/raw/${TAG}/docs/images/logos/trickster-logo.svg" width=60 />&nbsp;&nbsp;&nbsp;&nbsp;<img src="https://github.com/trickstercache/trickster/raw/${TAG}/docs/images/logos/trickster-text.svg" width=280 />
+
 Welcome to ${TAG}! :tada:
 
 <!-- In this release, we:
