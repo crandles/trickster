@@ -25,5 +25,7 @@ docker run --name trickster -d -v /path/to/trickster.yaml:/etc/trickster/trickst
 helm install trickster oci://ghcr.io/trickstercache/charts/trickster --version ${TAG}
 ```
 
-For more information, see the [helm chart](https://github.com/trickstercache/helm-charts).
+For more information, see:
+* [Trying Out Trickster](https://github.com/trickstercache/trickster/tree/${TAG}#trying-out-trickster)
+* trickster's [helm chart](https://github.com/trickstercache/helm-charts).
 </details>
