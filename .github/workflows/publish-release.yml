@@ -57,7 +57,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG=${{ steps.baretag.outputs.baretag }} envsubst < ./hack/release-notes/notes.md > /tmp/notes.md
+          REPO=${{ github.repository}} TAG=${{ steps.baretag.outputs.baretag }} envsubst < ./hack/release-notes/notes.md > /tmp/notes.md
           gh release create ${{ github.ref_name }} \
             --generate-notes \
             --notes-file /tmp/notes.md \
