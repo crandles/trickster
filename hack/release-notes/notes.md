@@ -1,6 +1,6 @@
 # <img src="https://github.com/${REPO}/raw/${TAG}/docs/images/logos/trickster-logo.svg" width=60 />&nbsp;&nbsp;&nbsp;&nbsp;<img src="https://github.com/${REPO}/raw/${TAG}/docs/images/logos/trickster-text.svg" width=280 />
 
-Welcome to ${TAG}! :tada:
+Welcome to Trickster ${TAG}! :tada:
 
 <!-- In this release, we:
 * Summary of high-level changes -->
