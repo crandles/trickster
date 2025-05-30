@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
--include ci.mk
+-include ci.mk release.mk
 
 DEFAULT: build
 
