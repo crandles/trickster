@@ -90,12 +90,18 @@ func queryConcurrent(_ context.Context, c cache.Cache, key string) *queryResult 
 		if inflate {
 			// tl.Debug(rsc.Logger, "decompressing cached data", tl.Pairs{"cacheKey": key})
 			decoder := brotli.NewReader(bytes.NewReader(b))
-			b, qr.err = io.ReadAll(decoder)
+			decompBuf := getDecompBuf()
+			_, qr.err = io.Copy(decompBuf, decoder)
 			if qr.err != nil {
+				putDecompBuf(decompBuf)
 				return qr
 			}
+			b = decompBuf.Bytes()
+			_, qr.err = qr.d.UnmarshalMsg(b)
+			putDecompBuf(decompBuf)
+		} else {
+			_, qr.err = qr.d.UnmarshalMsg(b)
 		}
-		_, qr.err = qr.d.UnmarshalMsg(b)
 		if qr.err != nil {
 			return qr
 		}
@@ -202,7 +208,6 @@ func writeConcurrent(_ context.Context, c cache.Cache, key string, d *HTTPDocume
 	compress bool, ttl time.Duration,
 ) error {
 	var b []byte
-	var err error
 
 	// for memory cache, don't serialize the document, since we can retrieve it by reference.
 	if c.Configuration().Provider == providerMemory {
@@ -223,21 +228,25 @@ func writeConcurrent(_ context.Context, c cache.Cache, key string, d *HTTPDocume
 	}
 
 	// for non-memory, we have to serialize the document to a byte slice to store
-	b, err = d.MarshalMsg(nil)
+	marshalBuf := getMarshalBuf()
+	marshalOut, err := d.MarshalMsg(marshalBuf)
 	if err != nil {
+		putMarshalBuf(marshalOut)
 		return err
 	}
 
 	// skip compression for small payloads where overhead exceeds benefit
-	if compress && len(b) >= 512 {
+	if compress && len(marshalOut) >= 512 {
 		buf := bytes.NewBuffer([]byte{1})
 		encoder := brotli.NewWriter(buf)
-		encoder.Write(b)
+		encoder.Write(marshalOut)
 		encoder.Close()
+		putMarshalBuf(marshalOut)
 		b = buf.Bytes()
 	} else {
-		buf := make([]byte, len(b)+1)
-		copy(buf[1:], b)
+		buf := make([]byte, len(marshalOut)+1)
+		copy(buf[1:], marshalOut)
+		putMarshalBuf(marshalOut)
 		b = buf
 	}
 
