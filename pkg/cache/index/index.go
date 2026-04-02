@@ -65,8 +65,12 @@ func (o *Object) Equal(other *Object) bool {
 
 // ToBytes returns a serialized byte slice representing the Object
 func (o *Object) ToBytes() []byte {
-	bytes, _ := o.MarshalMsg(nil)
-	return bytes
+	marshalBuf := getObjectMsgBuf()
+	b, _ := o.MarshalMsg(marshalBuf)
+	// copy out so the pool buffer can be reused
+	out := append([]byte(nil), b...)
+	putObjectMsgBuf(b)
+	return out
 }
 
 // ObjectFromBytes returns a deserialized Cache Object from a serialized byte slice
@@ -74,6 +78,21 @@ func ObjectFromBytes(data []byte) (*Object, error) {
 	o := &Object{}
 	_, err := o.UnmarshalMsg(data)
 	return o, err
+}
+
+// extractObjectValue deserializes data into a pooled Object, extracts and returns the Value,
+// and returns the Object to the pool
+func extractObjectValue(data []byte) ([]byte, error) {
+	o := getObject()
+	_, err := o.UnmarshalMsg(data)
+	if err != nil {
+		putObject(o)
+		return nil, err
+	}
+	val := o.Value
+	o.Value = nil // prevent putObject from clearing the slice we're returning
+	putObject(o)
+	return val, nil
 }
 
 func reap(cacheSize int64, objectCount int64, remainders objectsAtime, opts options.Options) (evictionType string, removals []string) {
