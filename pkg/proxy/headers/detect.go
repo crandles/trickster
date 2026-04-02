@@ -27,7 +27,8 @@ func HasHeaderValue(r *http.Request, name, val string) bool {
 	if r == nil || len(r.Header) == 0 {
 		return false
 	}
-	return strings.HasPrefix(strings.ToLower(r.Header.Get(name)), val)
+	v := r.Header.Get(name)
+	return len(v) >= len(val) && strings.EqualFold(v[:len(val)], val)
 }
 
 // AcceptsContentType returns true if r has an Accept header of contentType

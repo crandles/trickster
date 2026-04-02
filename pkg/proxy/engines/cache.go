@@ -19,7 +19,6 @@ package engines
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -358,5 +357,5 @@ func DocumentFromHTTPResponse(resp *http.Response, body []byte,
 }
 
 func getSubKey(key string, chunkExtent timeseries.Extent) string {
-	return fmt.Sprintf("%s.%s", key, chunkExtent)
+	return key + "." + chunkExtent.String()
 }
