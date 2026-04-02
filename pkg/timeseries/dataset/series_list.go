@@ -24,7 +24,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/trickstercache/trickster/v2/pkg/util/sets"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -45,7 +44,7 @@ func (sl SeriesList) Merge(sl2 SeriesList, sortPoints bool) SeriesList {
 	if len(sl) == 0 {
 		return sl2.Clone()
 	}
-	m := make(map[Hash]*Series, len(sl)+len(sl2))
+	m := getSeriesHashMap()
 	out := make(SeriesList, len(sl)+len(sl2))
 	var k int
 	for _, s := range sl {
@@ -60,7 +59,7 @@ func (sl SeriesList) Merge(sl2 SeriesList, sortPoints bool) SeriesList {
 		m[h] = s
 		k++
 	}
-	seen := make(sets.Set[Hash], len(sl2))
+	seen := getHashSet()
 	var wg sync.WaitGroup
 	for _, s := range sl2 {
 		if s == nil {
@@ -85,6 +84,8 @@ func (sl SeriesList) Merge(sl2 SeriesList, sortPoints bool) SeriesList {
 		}
 	}
 	wg.Wait()
+	putSeriesHashMap(m)
+	putHashSet(seen)
 	out = out[:k]
 	out.SortByTags()
 	return out
@@ -144,7 +145,7 @@ func (sl SeriesList) MergeWithStrategy(sl2 SeriesList, sortPoints bool, strategy
 	if len(sl) == 0 {
 		return sl2.Clone()
 	}
-	m := make(map[Hash]*Series, len(sl)+len(sl2))
+	m := getSeriesHashMap()
 	out := make(SeriesList, len(sl)+len(sl2))
 	var k int
 	for _, s := range sl {
@@ -159,7 +160,7 @@ func (sl SeriesList) MergeWithStrategy(sl2 SeriesList, sortPoints bool, strategy
 		m[h] = s
 		k++
 	}
-	seen := make(sets.Set[Hash], len(sl2))
+	seen := getHashSet()
 	var wg sync.WaitGroup
 	for _, s := range sl2 {
 		if s == nil {
@@ -182,6 +183,8 @@ func (sl SeriesList) MergeWithStrategy(sl2 SeriesList, sortPoints bool, strategy
 		}
 	}
 	wg.Wait()
+	putSeriesHashMap(m)
+	putHashSet(seen)
 	out = out[:k]
 	out.SortByTags()
 	return out
