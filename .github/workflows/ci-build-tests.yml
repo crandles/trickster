@@ -116,7 +116,13 @@ jobs:
         run: make developer-seed-data
       - name: Show container status
         if: always()
-        run: cd docs/developer/environment && docker compose ps && docker compose logs prometheus --tail=30
+        run: |
+          cd docs/developer/environment
+          docker compose ps
+          for svc in prometheus redis; do
+            echo "=== $svc logs ==="
+            docker compose logs "$svc" --tail=30
+          done
       - name: Run integration tests
         run: make integration-test
   finish:
