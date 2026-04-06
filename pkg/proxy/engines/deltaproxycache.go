@@ -44,6 +44,7 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/proxy/headers"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/request"
 	"github.com/trickstercache/trickster/v2/pkg/timeseries"
+	"github.com/trickstercache/trickster/v2/pkg/timeseries/dataset"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
@@ -311,7 +312,7 @@ func DeltaProxyCacheRequest(w http.ResponseWriter, r *http.Request, modeler *tim
 						return buildErrorResult(doc.StatusCode, doc.SafeHeaderClone(), doc.Body), nil
 					}
 				} else {
-					cts = doc.timeseries.Clone() // Load the Cached Timeseries
+					cts = doc.timeseries // lazy: no clone yet, read-only until mutation
 					if o.TimeseriesEvictionMethod == evictionmethods.EvictionMethodLRU {
 						el := cts.Extents()
 						tsc := cts.TimestampCount()
@@ -356,6 +357,12 @@ func DeltaProxyCacheRequest(w http.ResponseWriter, r *http.Request, modeler *tim
 			} else if len(missRanges) == 1 && missRanges[0].Start.Equal(trq.Extent.Start) &&
 				missRanges[0].End.Equal(trq.Extent.End) {
 				cacheStatus = status.LookupStatusRangeMiss
+			}
+
+			// deep clone before first mutation (Merge/SetVolatileExtents);
+			// on full hits this block is skipped, avoiding the clone entirely
+			if cacheStatus != status.LookupStatusHit && cacheStatus != status.LookupStatusKeyMiss {
+				cts = doc.timeseries.Clone()
 			}
 
 			// this concurrently fetches all missing ranges from the origin
@@ -415,12 +422,22 @@ func DeltaProxyCacheRequest(w http.ResponseWriter, r *http.Request, modeler *tim
 				}
 			}
 
-			// cts is the cacheable time series, rts is the user's response timeseries
+			// cts is the cacheable time series, rts is the user's response timeseries.
+			// Shallow clone shares Point.Values backing arrays — safe because rts
+			// is only read (marshal + fast-forward merge of new points) after this.
 			var rts timeseries.Timeseries
 			if cacheStatus != status.LookupStatusKeyMiss {
-				rts = cts.CroppedClone(trq.Extent)
+				if ds, ok := cts.(*dataset.DataSet); ok {
+					rts = ds.ShallowCroppedClone(trq.Extent)
+				} else {
+					rts = cts.CroppedClone(trq.Extent)
+				}
 			} else {
-				rts = cts.Clone()
+				if ds, ok := cts.(*dataset.DataSet); ok {
+					rts = ds.ShallowClone()
+				} else {
+					rts = cts.Clone()
+				}
 			}
 
 			// Crop the Cache Object down to the Sample Size or Age Retention Policy and the
@@ -542,7 +559,7 @@ func DeltaProxyCacheRequest(w http.ResponseWriter, r *http.Request, modeler *tim
 		Respond(w, doc.StatusCode, h, bytes.NewReader(doc.Body))
 		return
 	}
-	rts = cts.Clone()
+	rts = cts // cts is not referenced again; no clone needed
 
 	tspan.SetAttributes(rsc.Tracer, span, attribute.String("cache.status", cacheStatus.String()))
 

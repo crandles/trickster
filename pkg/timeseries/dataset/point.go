@@ -88,6 +88,21 @@ func (p Points) Clone() Points {
 	return clone
 }
 
+// CloneRangeShallow returns a copy of the Points in the provided index range
+// (upper-bound exclusive), copying Point structs but sharing the Values backing
+// arrays. Caller must not mutate Values in either the original or the returned
+// slice.
+func (p Points) CloneRangeShallow(start, end int) Points {
+	if end < start {
+		return nil
+	}
+	size := end - start
+	if size > len(p) {
+		return nil
+	}
+	return append(Points(nil), p[start:end]...)
+}
+
 // CloneRange returns a perfect copy of the Points, cloning only the
 // points in the provided index range (upper-bound exclusive)
 func (p Points) CloneRange(start, end int) Points {

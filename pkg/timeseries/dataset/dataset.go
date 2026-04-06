@@ -216,6 +216,160 @@ func (ds *DataSet) Clone() timeseries.Timeseries {
 	return clone
 }
 
+// ShallowClone returns a copy of the DataSet that shares Point.Values backing
+// arrays with the original. This avoids the per-point []any allocation of Clone.
+// Caller must not mutate Point.Values in either the original or the returned DataSet.
+func (ds *DataSet) ShallowClone() *DataSet {
+	ds.UpdateLock.Lock()
+	defer ds.UpdateLock.Unlock()
+	clone := &DataSet{
+		Error:        ds.Error,
+		Sorter:       ds.Sorter,
+		Merger:       ds.Merger,
+		SizeCropper:  ds.SizeCropper,
+		RangeCropper: ds.RangeCropper,
+		Results:      make([]*Result, len(ds.Results)),
+	}
+	if ds.TimeRangeQuery != nil {
+		clone.TimeRangeQuery = ds.TimeRangeQuery.Clone()
+	}
+	if ds.ExtentList != nil {
+		clone.ExtentList = ds.ExtentList.Clone()
+	}
+	if ds.VolatileExtentList != nil {
+		clone.VolatileExtentList = ds.VolatileExtentList.Clone()
+	}
+	var k int
+	for _, r := range ds.Results {
+		if r == nil {
+			continue
+		}
+		clone.Results[k] = shallowCloneResult(r)
+		k++
+	}
+	clone.Results = clone.Results[:k]
+	return clone
+}
+
+// ShallowCroppedClone returns a copy of the DataSet cropped to the provided
+// Extent, sharing Point.Values backing arrays with the original. This avoids
+// the per-point []any allocation of CroppedClone.
+// Caller must not mutate Point.Values in either the original or the returned DataSet.
+func (ds *DataSet) ShallowCroppedClone(e timeseries.Extent) *DataSet {
+	x := len(ds.ExtentList)
+	if x == 0 || ds.Results == nil {
+		return ds.ShallowClone()
+	}
+	if ds.ExtentList.EncompassedBy(e) {
+		clone := ds.ShallowClone()
+		clone.ExtentList = clone.ExtentList.Crop(e)
+		return clone
+	}
+
+	clone := &DataSet{
+		Error:        ds.Error,
+		Sorter:       ds.Sorter,
+		Merger:       ds.Merger,
+		SizeCropper:  ds.SizeCropper,
+		RangeCropper: ds.RangeCropper,
+		Results:      make([]*Result, len(ds.Results)),
+	}
+	ds.UpdateLock.Lock()
+	defer ds.UpdateLock.Unlock()
+	if ds.TimeRangeQuery != nil {
+		clone.TimeRangeQuery = ds.TimeRangeQuery.Clone()
+	}
+	if ds.ExtentList.OutsideOf(e) {
+		for i := range ds.Results {
+			if ds.Results[i] == nil {
+				continue
+			}
+			clone.Results[i] = &Result{
+				StatementID: ds.Results[i].StatementID,
+				Error:       ds.Results[i].Error,
+				SeriesList:  make([]*Series, 0),
+			}
+		}
+		clone.ExtentList = timeseries.ExtentList{}
+		return clone
+	}
+	clone.ExtentList = ds.ExtentList.Clone().Crop(e)
+	clone.VolatileExtentList = ds.VolatileExtentList.Clone().Crop(e)
+
+	startNS := epoch.Epoch(e.Start.UnixNano())
+	endNS := epoch.Epoch(e.End.UnixNano())
+
+	for i := range ds.Results {
+		if ds.Results[i] == nil {
+			continue
+		}
+		clone.Results[i] = &Result{
+			StatementID: ds.Results[i].StatementID,
+			Error:       ds.Results[i].Error,
+		}
+		clone.Results[i].SeriesList = make([]*Series, len(ds.Results[i].SeriesList))
+		eg := errgroup.Group{}
+		eg.SetLimit(runtime.GOMAXPROCS(0))
+		var skips int32
+		for j, s := range ds.Results[i].SeriesList {
+			if s == nil || len(s.Points) == 0 {
+				atomic.StoreInt32(&skips, 1)
+				continue
+			}
+			n := i
+			eg.Go(func() error {
+				sc := &Series{
+					Header: s.Header.Clone(),
+				}
+				l := len(s.Points)
+				start, end := s.Points.findRange(startNS, endNS, 0, l-1)
+				if start < l && end <= l && end > start {
+					sc.Points = s.Points.CloneRangeShallow(start, end)
+					sc.PointSize = sc.Points.Size()
+					clone.Results[n].SeriesList[j] = sc
+				} else {
+					atomic.StoreInt32(&skips, 1)
+				}
+				return nil
+			})
+		}
+		eg.Wait()
+		if skips == 1 {
+			sl := make([]*Series, len(clone.Results[i].SeriesList))
+			var k int
+			for _, s := range clone.Results[i].SeriesList {
+				if s == nil {
+					continue
+				}
+				sl[k] = s
+				k++
+			}
+			clone.Results[i].SeriesList = sl[:k]
+		}
+	}
+	return clone
+}
+
+func shallowCloneResult(r *Result) *Result {
+	clone := &Result{
+		Name:        r.Name,
+		StatementID: r.StatementID,
+		Error:       r.Error,
+		SeriesList:  make([]*Series, len(r.SeriesList)),
+	}
+	for i, s := range r.SeriesList {
+		if s == nil {
+			continue
+		}
+		clone.SeriesList[i] = &Series{
+			Header:    s.Header.Clone(),
+			Points:    append(Points(nil), s.Points...),
+			PointSize: s.PointSize,
+		}
+	}
+	return clone
+}
+
 // Merge merges the provided Timeseries list into the base DataSet
 // (in the order provided) and optionally sorts the merged DataSet
 // This implementation ignores any Timeseries that are not of type *DataSet

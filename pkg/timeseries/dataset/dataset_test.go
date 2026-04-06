@@ -19,6 +19,7 @@ package dataset
 import (
 	"fmt"
 	"math/rand"
+	"strconv"
 	"testing"
 	"time"
 
@@ -1019,5 +1020,194 @@ func BenchmarkCropToRange(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		dss[i].CropToRange(bmExt)
+	}
+}
+
+func TestShallowClone(t *testing.T) {
+	ds := testDataSet2()
+	clone := ds.ShallowClone()
+
+	// structural equivalence: same number of results, series, points
+	if len(clone.Results) != 2 { // testDataSet2 has 2 non-nil results
+		t.Fatalf("expected 2 results, got %d", len(clone.Results))
+	}
+	for i, r := range clone.Results {
+		origR := ds.Results[i]
+		if len(r.SeriesList) != len(origR.SeriesList) {
+			t.Fatalf("result %d: series count mismatch: %d vs %d",
+				i, len(r.SeriesList), len(origR.SeriesList))
+		}
+		for j, s := range r.SeriesList {
+			if s == nil {
+				continue
+			}
+			origS := origR.SeriesList[j]
+			if len(s.Points) != len(origS.Points) {
+				t.Fatalf("result %d series %d: point count mismatch", i, j)
+			}
+			// verify Values backing arrays are shared
+			for k := range s.Points {
+				if len(s.Points[k].Values) == 0 {
+					continue
+				}
+				s.Points[k].Values[0] = 999
+				if origS.Points[k].Values[0] != 999 {
+					t.Fatal("shallow clone did not share Values backing array")
+				}
+				origS.Points[k].Values[0] = 1 // restore
+			}
+		}
+	}
+
+	// verify metadata was cloned (not shared)
+	clone.ExtentList = nil
+	if ds.ExtentList == nil {
+		t.Fatal("modifying clone's ExtentList affected original")
+	}
+}
+
+func TestShallowCroppedClone(t *testing.T) {
+	// extent fully inside the time series's extent
+	ex := timeseries.Extent{Start: time.Unix(15, 0), End: time.Unix(20, 0)}
+
+	ds := testDataSet2()
+	clone := ds.ShallowCroppedClone(ex)
+
+	exs := clone.Extents()
+	if len(exs) != 1 || exs[0].Start != time.Unix(15, 0) || exs[0].End != time.Unix(20, 0) {
+		t.Error("invalid extent in shallow clone", exs)
+	}
+
+	// extent fully surrounding
+	ex2 := timeseries.Extent{Start: time.Unix(0, 0), End: time.Unix(35, 0)}
+	ds2 := testDataSet2()
+	clone2 := ds2.ShallowCroppedClone(ex2)
+	exs2 := clone2.Extents()
+	if len(exs2) != 1 || exs2[0].Start != time.Unix(5, 0) || exs2[0].End != time.Unix(30, 0) {
+		t.Error("invalid extent in shallow clone (encompassed)", exs2)
+	}
+
+	// extent fully outside
+	ex3 := timeseries.Extent{Start: time.Unix(35, 0), End: time.Unix(50, 0)}
+	ds3 := testDataSet2()
+	clone3 := ds3.ShallowCroppedClone(ex3)
+	exs3 := clone3.Extents()
+	if len(exs3) != 0 {
+		t.Error("expected empty extents for outside crop", exs3)
+	}
+
+	// nil extent list
+	ds4 := testDataSet2()
+	ds4.ExtentList = nil
+	clone4 := ds4.ShallowCroppedClone(ex)
+	if clone4.ExtentList != nil {
+		t.Error("expected nil extent list")
+	}
+}
+
+func TestCloneRangeShallow(t *testing.T) {
+	pts := newPoints()
+	shallow := pts.CloneRangeShallow(1, 4)
+	if len(shallow) != 3 {
+		t.Fatalf("expected 3 points, got %d", len(shallow))
+	}
+	// verify struct values match
+	for i := range shallow {
+		if shallow[i].Epoch != pts[i+1].Epoch {
+			t.Fatalf("epoch mismatch at %d", i)
+		}
+	}
+	// verify Values are shared
+	if len(shallow[0].Values) > 0 {
+		shallow[0].Values[0] = 42
+		if pts[1].Values[0] != 42 {
+			t.Fatal("Values not shared in shallow clone")
+		}
+		pts[1].Values[0] = 1 // restore
+	}
+
+	// edge cases
+	if pts.CloneRangeShallow(3, 2) != nil {
+		t.Error("expected nil for end < start")
+	}
+	if pts.CloneRangeShallow(0, len(pts)+1) != nil {
+		t.Error("expected nil for out of bounds")
+	}
+}
+
+func genBenchmarkDatasetMultiSeries(seriesCount, pointsPerSeries int) *DataSet {
+	// use fixed, step-aligned epochs (nanoseconds) so crop/findRange work correctly
+	startSec := int64(1_700_000_000)
+	sl := make([]*Series, seriesCount)
+	for s := range seriesCount {
+		pts := make(Points, pointsPerSeries)
+		for i := range pointsPerSeries {
+			pts[i] = Point{
+				Epoch:  epoch.Epoch((startSec + int64(i)) * int64(timeseries.Second)),
+				Size:   32,
+				Values: []any{float64(i), float64(s)},
+			}
+		}
+		sl[s] = &Series{
+			Header: SeriesHeader{Name: "series_" + strconv.Itoa(s)},
+			Points: pts,
+		}
+	}
+	return &DataSet{
+		Results: []*Result{{SeriesList: sl}},
+		ExtentList: timeseries.ExtentList{{
+			Start: time.Unix(startSec, 0),
+			End:   time.Unix(startSec+int64(pointsPerSeries-1), 0),
+		}},
+		TimeRangeQuery: &timeseries.TimeRangeQuery{Step: time.Second},
+	}
+}
+
+// Clone/CroppedClone/ShallowClone/ShallowCroppedClone do not mutate the source
+// DataSet, so a single shared dataset is reused across b.N iterations to avoid
+// pre-allocating b.N*3.6MB of fixtures.
+func BenchmarkCroppedClone(b *testing.B) {
+	startSec := int64(1_700_000_000)
+	bmExt := timeseries.Extent{
+		Start: time.Unix(startSec+250, 0),
+		End:   time.Unix(startSec+749, 0),
+	}
+	ds := genBenchmarkDatasetMultiSeries(50, 1000)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		ds.CroppedClone(bmExt)
+	}
+}
+
+func BenchmarkShallowCroppedClone(b *testing.B) {
+	startSec := int64(1_700_000_000)
+	bmExt := timeseries.Extent{
+		Start: time.Unix(startSec+250, 0),
+		End:   time.Unix(startSec+749, 0),
+	}
+	ds := genBenchmarkDatasetMultiSeries(50, 1000)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		ds.ShallowCroppedClone(bmExt)
+	}
+}
+
+func BenchmarkClone(b *testing.B) {
+	ds := genBenchmarkDatasetMultiSeries(50, 1000)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		ds.Clone()
+	}
+}
+
+func BenchmarkShallowClone(b *testing.B) {
+	ds := genBenchmarkDatasetMultiSeries(50, 1000)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		ds.ShallowClone()
 	}
 }
