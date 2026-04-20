@@ -22,6 +22,7 @@ package native
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,7 +31,6 @@ import (
 	"strings"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
-	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	bo "github.com/trickstercache/trickster/v2/pkg/backends/options"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/request"
 )
@@ -38,7 +38,7 @@ import (
 // NativeClient wraps a clickhouse-go native connection pool and exposes a
 // Fetcher compatible with bo.Options.Fetcher.
 type NativeClient struct {
-	conn driver.Conn
+	db *sql.DB
 }
 
 // NewNativeClient creates a NativeClient from the backend options. The
@@ -51,19 +51,16 @@ func NewNativeClient(o *bo.Options) (*NativeClient, error) {
 	if !strings.Contains(addr, ":") {
 		addr += ":9000"
 	}
-	conn, err := clickhouse.Open(&clickhouse.Options{
+	db := clickhouse.OpenDB(&clickhouse.Options{
 		Addr:     []string{addr},
 		Protocol: clickhouse.Native,
 	})
-	if err != nil {
-		return nil, fmt.Errorf("clickhouse native: open: %w", err)
-	}
-	return &NativeClient{conn: conn}, nil
+	return &NativeClient{db: db}, nil
 }
 
 // Close closes the underlying connection pool.
 func (nc *NativeClient) Close() error {
-	return nc.conn.Close()
+	return nc.db.Close()
 }
 
 // Fetch executes the SQL query embedded in the *http.Request (body or query
@@ -79,14 +76,20 @@ func (nc *NativeClient) Fetch(r *http.Request) (*http.Response, error) {
 		return syntheticErrorResponse(http.StatusBadRequest, err), nil
 	}
 
-	rows, err := nc.conn.Query(r.Context(), sql)
+	rows, err := nc.db.QueryContext(r.Context(), sql) // #nosec G701 -- proxy passthrough; SQL is forwarded verbatim from client
 	if err != nil {
 		return syntheticErrorResponse(http.StatusBadGateway, err), nil
 	}
 	defer rows.Close()
 
-	colTypes := rows.ColumnTypes()
-	colNames := rows.Columns()
+	colNames, err := rows.Columns()
+	if err != nil {
+		return syntheticErrorResponse(http.StatusBadGateway, err), nil
+	}
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		return syntheticErrorResponse(http.StatusBadGateway, err), nil
+	}
 
 	meta := make([]map[string]string, len(colNames))
 	for i, name := range colNames {
@@ -97,18 +100,18 @@ func (nc *NativeClient) Fetch(r *http.Request) (*http.Response, error) {
 	}
 
 	data := make([]map[string]any, 0, 64)
-	scanDest := make([]any, len(colNames))
-	for i := range scanDest {
-		scanDest[i] = new(any)
-	}
-
 	for rows.Next() {
-		if err := rows.Scan(scanDest...); err != nil {
+		scanDest := make([]any, len(colNames))
+		ptrs := make([]any, len(colNames))
+		for i := range scanDest {
+			ptrs[i] = &scanDest[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
 			return syntheticErrorResponse(http.StatusBadGateway, err), nil
 		}
 		row := make(map[string]any, len(colNames))
 		for i, name := range colNames {
-			row[name] = *(scanDest[i].(*any))
+			row[name] = scanDest[i]
 		}
 		data = append(data, row)
 	}
