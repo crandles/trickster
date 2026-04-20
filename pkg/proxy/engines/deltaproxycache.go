@@ -316,6 +316,8 @@ func DeltaProxyCacheRequest(w http.ResponseWriter, r *http.Request, modeler *tim
 					if err != nil {
 						return buildErrorResult(doc.StatusCode, doc.SafeHeaderClone(), doc.Body), nil
 					}
+					// entry was removed and data came from origin; don't inherit the pre-recovery status
+					cacheStatus = status.LookupStatusKeyMiss
 				} else {
 					cts = doc.timeseries.Clone() // Load the Cached Timeseries
 					if o.TimeseriesEvictionMethod == evictionmethods.EvictionMethodLRU {
