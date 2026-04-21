@@ -608,7 +608,8 @@ func TestDeltaProxyCacheRequestRangeMissChunks(t *testing.T) {
 
 	step := time.Duration(3600) * time.Second
 
-	now := time.Now()
+	// fixed to keep all three queries in the same 17.5d chunk bucket; see the _CrossBucket test
+	now := time.Date(2026, 4, 15, 12, 0, 0, 0, time.UTC)
 	end := now.Add(-time.Duration(12) * time.Hour)
 
 	extr := timeseries.Extent{Start: end.Add(-time.Duration(18) * time.Hour), End: end}
@@ -733,6 +734,146 @@ func TestDeltaProxyCacheRequestRangeMissChunks(t *testing.T) {
 
 	err = testResultHeaderPartMatch(resp.Header, map[string]string{"fetched": expectedFetched})
 	if err != nil {
+		t.Error(err)
+	}
+}
+
+// Regression: when the kmiss write and a later query land in different 17.5d
+// chunk buckets, all chunk reads miss and the recovery path must report kmiss,
+// not the cache's pre-recovery Hit.
+func TestDeltaProxyCacheRequestRangeMissChunks_CrossBucket(t *testing.T) {
+	ts, w, r, rsc, err := setupTestHarnessDPC()
+	rsc.CacheConfig.UseCacheChunking = true
+	if err != nil {
+		t.Error(err)
+	}
+	defer ts.Close()
+
+	client := rsc.BackendClient.(*TestClient)
+	o := rsc.BackendOptions
+	rsc.CacheConfig.Provider = "test"
+	o.FastForwardDisable = true
+
+	step := time.Duration(3600) * time.Second
+
+	// kmiss write in bucket ending 2026-04-20T00:00Z; high-end read in next bucket
+	now := time.Date(2026, 4, 20, 11, 0, 0, 0, time.UTC)
+	end := now.Add(-time.Duration(12) * time.Hour)
+
+	extr := timeseries.Extent{Start: end.Add(-time.Duration(18) * time.Hour), End: end}
+	extn := timeseries.Extent{Start: extr.Start.Truncate(step), End: extr.End.Truncate(step)}
+
+	expected, _, _ := mockprom.GetTimeSeriesData(queryReturnsOKNoLatency, extn.Start, extn.End, step)
+
+	u := r.URL
+	u.Path = "/prometheus/api/v1/query_range"
+	u.RawQuery = fmt.Sprintf("step=%d&start=%d&end=%d&query=%s",
+		int(step.Seconds()), extr.Start.Unix(), extr.End.Unix(), queryReturnsOKNoLatency)
+
+	client.QueryRangeHandler(w, r)
+	resp := w.Result()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Error(err)
+	}
+	if err = testStringMatch(string(bodyBytes), expected); err != nil {
+		t.Error(err)
+	}
+	if err = testStatusCodeMatch(resp.StatusCode, http.StatusOK); err != nil {
+		t.Error(err)
+	}
+	if err = testResultHeaderPartMatch(resp.Header, map[string]string{"status": "kmiss"}); err != nil {
+		t.Error(err)
+	}
+
+	time.Sleep(time.Millisecond * 10)
+
+	// high-end query in next bucket: meta hits, all chunks miss, recovery must report kmiss
+	extr.Start = now.Add(time.Duration(-10) * time.Hour)
+	extn.Start = extr.Start.Truncate(step)
+	extr.End = now.Add(time.Duration(-8) * time.Hour)
+	extn.End = extr.End.Truncate(step)
+
+	expected, _, _ = mockprom.GetTimeSeriesData(queryReturnsOKNoLatency, extn.Start, extn.End, step)
+	u.RawQuery = fmt.Sprintf("step=%d&start=%d&end=%d&query=%s",
+		int(step.Seconds()), extr.Start.Unix(), extr.End.Unix(), queryReturnsOKNoLatency)
+	r.URL = u
+
+	w = httptest.NewRecorder()
+	client.QueryRangeHandler(w, r)
+	resp = w.Result()
+
+	if err = testStatusCodeMatch(resp.StatusCode, http.StatusOK); err != nil {
+		t.Error(err)
+	}
+	bodyBytes, err = io.ReadAll(resp.Body)
+	if err != nil {
+		t.Error(err)
+	}
+	if err = testStringMatch(string(bodyBytes), expected); err != nil {
+		t.Error(err)
+	}
+	if err = testResultHeaderPartMatch(resp.Header, map[string]string{"status": "kmiss"}); err != nil {
+		t.Error(err)
+	}
+}
+
+// Recovery calls cache.Remove(key) on the meta, but chunks are keyed by
+// deterministic subkey (not via the meta), and the recovery's refetch
+// rewrites the meta. A later query for a still-cached sibling bucket must
+// still hit, not refetch from origin.
+func TestDeltaProxyCacheRequestRangeMissChunks_CrossBucketPreservesPriorChunks(t *testing.T) {
+	ts, w, r, rsc, err := setupTestHarnessDPC()
+	rsc.CacheConfig.UseCacheChunking = true
+	if err != nil {
+		t.Error(err)
+	}
+	defer ts.Close()
+
+	client := rsc.BackendClient.(*TestClient)
+	o := rsc.BackendOptions
+	rsc.CacheConfig.Provider = "test"
+	o.FastForwardDisable = true
+
+	step := time.Duration(3600) * time.Second
+	now := time.Date(2026, 4, 20, 11, 0, 0, 0, time.UTC)
+
+	runQuery := func(start, end time.Time) *http.Response {
+		u := r.URL
+		u.Path = "/prometheus/api/v1/query_range"
+		u.RawQuery = fmt.Sprintf("step=%d&start=%d&end=%d&query=%s",
+			int(step.Seconds()), start.Unix(), end.Unix(), queryReturnsOKNoLatency)
+		r.URL = u
+		w = httptest.NewRecorder()
+		client.QueryRangeHandler(w, r)
+		return w.Result()
+	}
+
+	// Q1: warm bucket N
+	q1Start := now.Add(-30 * time.Hour).Truncate(step)
+	q1End := now.Add(-12 * time.Hour).Truncate(step)
+	resp := runQuery(q1Start, q1End)
+	_, _ = io.ReadAll(resp.Body)
+	if err = testResultHeaderPartMatch(resp.Header, map[string]string{"status": "kmiss"}); err != nil {
+		t.Error(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	// Q2: cross-bucket query triggers recovery (meta hit, chunks miss, re-fetch + rewrite)
+	q2Start := now.Add(-10 * time.Hour).Truncate(step)
+	q2End := now.Add(-8 * time.Hour).Truncate(step)
+	resp = runQuery(q2Start, q2End)
+	_, _ = io.ReadAll(resp.Body)
+	if err = testResultHeaderPartMatch(resp.Header, map[string]string{"status": "kmiss"}); err != nil {
+		t.Error(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	// Q3: re-query Q1's range. chunk N must still be there.
+	resp = runQuery(q1Start, q1End)
+	_, _ = io.ReadAll(resp.Body)
+	if err = testResultHeaderPartMatch(resp.Header, map[string]string{"status": "hit"}); err != nil {
 		t.Error(err)
 	}
 }

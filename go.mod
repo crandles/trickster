@@ -3,11 +3,12 @@ module github.com/trickstercache/trickster/v2
 go 1.26.2
 
 require (
+	github.com/ClickHouse/ch-go v0.71.0
+	github.com/ClickHouse/clickhouse-go/v2 v2.45.0
 	github.com/alicebob/miniredis/v2 v2.37.0
 	github.com/andybalholm/brotli v1.2.1
 	github.com/dgraph-io/badger/v4 v4.9.1
 	github.com/dgraph-io/ristretto/v2 v2.4.0
-	github.com/golang/snappy v1.0.0
 	github.com/influxdata/influxdb v1.12.3
 	github.com/influxdata/influxql v1.4.1
 	github.com/klauspost/compress v1.18.5
@@ -47,8 +48,6 @@ require (
 	github.com/Antonboom/nilnil v1.1.1 // indirect
 	github.com/Antonboom/testifylint v1.6.4 // indirect
 	github.com/BurntSushi/toml v1.6.0 // indirect
-	github.com/ClickHouse/ch-go v0.71.0 // indirect
-	github.com/ClickHouse/clickhouse-go/v2 v2.45.0 // indirect
 	github.com/Djarvur/go-err113 v0.1.1 // indirect
 	github.com/Masterminds/semver/v3 v3.4.0 // indirect
 	github.com/MirrexOne/unqueryvet v1.5.4 // indirect
