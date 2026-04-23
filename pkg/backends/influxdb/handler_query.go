@@ -27,7 +27,6 @@ import (
 	isql "github.com/trickstercache/trickster/v2/pkg/backends/influxdb/sql"
 	"github.com/trickstercache/trickster/v2/pkg/errors"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/engines"
-	"github.com/trickstercache/trickster/v2/pkg/proxy/methods"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/params"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/request"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/urls"
@@ -67,17 +66,11 @@ func (c *Client) QueryHandler(w http.ResponseWriter, r *http.Request) {
 	engines.DeltaProxyCacheRequest(w, r, c.Modeler())
 }
 
-// isV3SelectQuery checks if a v3 request contains a SELECT query
+// isV3SelectQuery checks if a v3 request contains a SELECT query.
 func isV3SelectQuery(r *http.Request) bool {
-	var q string
-	if methods.HasBody(r.Method) {
-		b, err := request.GetBody(r)
-		if err != nil || len(b) == 0 {
-			return false
-		}
-		q = string(b)
-	} else {
-		q = r.URL.Query().Get(isql.ParamQuery)
+	q, err := isql.ExtractQuery(r)
+	if err != nil || q == "" {
+		return false
 	}
 	return slices.Contains(strings.Fields(strings.ToLower(q)), "select")
 }

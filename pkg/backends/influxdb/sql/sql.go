@@ -17,6 +17,7 @@
 package sql
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -70,6 +71,53 @@ const (
 
 // DefaultTimestampField is the default timestamp field name for v3 queries
 const DefaultTimestampField = "time"
+
+// ExtractQuery returns the SQL query text from a v3 request, decoding the
+// POST body based on Content-Type. Supports GET (?q=), POST application/json
+// ({"q":"..."}), POST application/x-www-form-urlencoded (q=...), and falls
+// back to treating the raw POST body as SQL.
+func ExtractQuery(r *http.Request) (string, error) {
+	if !methods.HasBody(r.Method) {
+		return r.URL.Query().Get(ParamQuery), nil
+	}
+	b, err := request.GetBody(r)
+	if err != nil || len(b) == 0 {
+		return "", err
+	}
+	ct := r.Header.Get("Content-Type")
+	switch {
+	case strings.HasPrefix(ct, "application/json"):
+		var payload struct {
+			Q string `json:"q"`
+		}
+		if err := json.Unmarshal(b, &payload); err != nil {
+			return "", err
+		}
+		return payload.Q, nil
+	case strings.HasPrefix(ct, "application/x-www-form-urlencoded"):
+		vals, err := url.ParseQuery(string(b))
+		if err != nil {
+			return "", err
+		}
+		return vals.Get(ParamQuery), nil
+	}
+	return string(b), nil
+}
+
+// EncodeBody wraps a SQL statement in the body format matching the request's
+// Content-Type. Used to preserve the inbound body shape when Trickster
+// rewrites the upstream request (e.g. on SetExtent).
+func EncodeBody(r *http.Request, sqlQuery string) []byte {
+	ct := r.Header.Get("Content-Type")
+	switch {
+	case strings.HasPrefix(ct, "application/json"):
+		b, _ := json.Marshal(map[string]string{ParamQuery: sqlQuery})
+		return b
+	case strings.HasPrefix(ct, "application/x-www-form-urlencoded"):
+		return []byte(url.Values{ParamQuery: {sqlQuery}}.Encode())
+	}
+	return []byte(sqlQuery)
+}
 
 var (
 	lexOpts  = LexerOptions()
@@ -135,18 +183,14 @@ func ParseTimeRangeQuery(r *http.Request, f iofmt.Format,
 	if r == nil || !f.IsV3SQL() {
 		return nil, nil, false, iofmt.ErrSupportedQueryLanguage
 	}
-	var sqlQuery string
 	var qi url.Values
 	isBody := methods.HasBody(r.Method)
-	if isBody {
-		b, err := request.GetBody(r)
-		if err != nil {
-			return nil, nil, false, err
-		}
-		sqlQuery = string(b)
-	} else {
+	sqlQuery, err := ExtractQuery(r)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if !isBody {
 		qi = r.URL.Query()
-		sqlQuery = qi.Get(ParamQuery)
 	}
 	if sqlQuery == "" {
 		return nil, nil, false, pe.MissingURLParam(ParamQuery)
@@ -175,7 +219,7 @@ func ParseTimeRangeQuery(r *http.Request, f iofmt.Format,
 	}
 	trq.TemplateURL = urls.Clone(r.URL)
 	if isBody {
-		request.SetBody(r, []byte(trq.Statement))
+		request.SetBody(r, EncodeBody(r, trq.Statement))
 	} else {
 		qi.Set(ParamQuery, trq.Statement)
 		trq.TemplateURL.RawQuery = qi.Encode()

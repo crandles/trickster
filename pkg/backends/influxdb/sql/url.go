@@ -37,7 +37,7 @@ func SetExtent(r *http.Request, trq *timeseries.TimeRangeQuery,
 	stmt := interpolateTimeQuery(q, trq.TimestampDefinition, extent)
 	isBody := methods.HasBody(r.Method)
 	if isBody {
-		request.SetBody(r, []byte(stmt))
+		request.SetBody(r, EncodeBody(r, stmt))
 	} else {
 		qi := r.URL.Query()
 		qi.Set(ParamQuery, stmt)

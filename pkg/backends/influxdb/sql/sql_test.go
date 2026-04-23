@@ -17,8 +17,11 @@
 package sql
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -124,6 +127,54 @@ func TestParseTimeRangeQuery_POST(t *testing.T) {
 	f := iofmt.Detect(r)
 	if !f.IsV3SQL() {
 		t.Fatal("expected V3SQL format")
+	}
+}
+
+func TestParseTimeRangeQuery_POST_JSON(t *testing.T) {
+	sqlQuery := "SELECT date_bin(INTERVAL '1 hour', time) AS time, avg(v) FROM m WHERE time >= 1704067200 AND time < 1704153600 GROUP BY 1"
+	body := []byte(`{"q":"` + sqlQuery + `"}`)
+	r := &http.Request{
+		Method:        http.MethodPost,
+		URL:           &url.URL{Path: "/api/v3/query_sql"},
+		Header:        http.Header{"Content-Type": {"application/json"}},
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+	f := iofmt.Detect(r)
+	trq, _, _, err := ParseTimeRangeQuery(r, f)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if trq.Step != time.Hour {
+		t.Errorf("step: got %v want 1h", trq.Step)
+	}
+	got, _ := io.ReadAll(r.Body)
+	if !strings.HasPrefix(string(got), "{") {
+		t.Errorf("expected JSON-wrapped body after parse, got: %s", got)
+	}
+}
+
+func TestParseTimeRangeQuery_POST_Form(t *testing.T) {
+	sqlQuery := "SELECT date_bin(INTERVAL '1 hour', time) AS time, avg(v) FROM m WHERE time >= 1704067200 AND time < 1704153600 GROUP BY 1"
+	body := []byte(url.Values{ParamQuery: {sqlQuery}}.Encode())
+	r := &http.Request{
+		Method:        http.MethodPost,
+		URL:           &url.URL{Path: "/api/v3/query_sql"},
+		Header:        http.Header{"Content-Type": {"application/x-www-form-urlencoded"}},
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+	f := iofmt.Detect(r)
+	trq, _, _, err := ParseTimeRangeQuery(r, f)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if trq.Step != time.Hour {
+		t.Errorf("step: got %v want 1h", trq.Step)
+	}
+	got, _ := io.ReadAll(r.Body)
+	if !strings.HasPrefix(string(got), "q=") {
+		t.Errorf("expected form-wrapped body after parse, got: %s", got)
 	}
 }
 
