@@ -154,6 +154,9 @@ func TestHandlerQuery(t *testing.T) {
 	cr.str()
 	cr.uvarint()
 
+	// Send addendum (quota key, required for revision >= 54458)
+	cw.putStr("")
+
 	// Send ClientQuery
 	sendTestQuery(t, cw, "SELECT 1")
 

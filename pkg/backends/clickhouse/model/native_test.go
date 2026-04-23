@@ -19,6 +19,7 @@ package model
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"math"
@@ -235,6 +236,40 @@ func TestWriteNativeValue_DateUnparsable(t *testing.T) {
 	// length written by the string fallback. Just verify bytes were written.
 	if b.Len() == 0 {
 		t.Fatal("expected bytes written on Date fallback")
+	}
+}
+
+func TestReadValueAsString_DateTimeWithTimezone(t *testing.T) {
+	// DateTime('UTC') is a 4-byte UInt32 on the ClickHouse native wire;
+	// the timezone is metadata only. Reading 8 bytes (as DateTime64 would)
+	// desynchronizes the column stream and corrupts every subsequent value.
+	for _, typ := range []string{
+		"DateTime('UTC')",
+		"DateTime('Asia/Tokyo')",
+		"DateTime('America/New_York')",
+	} {
+		b := new(bytes.Buffer)
+		// 1577836800 = 2020-01-01 00:00:00 UTC, written as 4-byte LE UInt32.
+		_ = binary.Write(b, binary.LittleEndian, uint32(1577836800))
+		// Sentinel UInt32 so we can detect over-read.
+		_ = binary.Write(b, binary.LittleEndian, uint32(0xDEADBEEF))
+
+		br := bufio.NewReader(bytes.NewReader(b.Bytes()))
+		got, err := readValueAsString(br, typ)
+		if err != nil {
+			t.Fatalf("%s: readValueAsString: %v", typ, err)
+		}
+		if got != "2020-01-01 00:00:00" {
+			t.Fatalf("%s: want 2020-01-01 00:00:00, got %q", typ, got)
+		}
+		// If readValueAsString consumed more than 4 bytes, the sentinel is lost.
+		next, err := readFixed(br, 4)
+		if err != nil {
+			t.Fatalf("%s: sentinel read: %v", typ, err)
+		}
+		if binary.LittleEndian.Uint32(next) != 0xDEADBEEF {
+			t.Fatalf("%s: sentinel mismatch: got %#x", typ, binary.LittleEndian.Uint32(next))
+		}
 	}
 }
 

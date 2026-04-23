@@ -23,6 +23,7 @@ import (
 	"io"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/trickstercache/trickster/v2/pkg/timeseries"
@@ -281,16 +282,21 @@ func readValueAsString(r *bufio.Reader, typ string) (string, error) {
 	case TypeString:
 		return readString(r)
 	default:
-		// For complex/unknown types, try reading as string
-		if len(typ) > 8 && typ[:8] == TypeDateTime {
-			// DateTime64, DateTime('tz'), etc. — 8 bytes
+		if strings.HasPrefix(typ, "DateTime64") {
 			b, err := readFixed(r, 8)
 			if err != nil {
 				return "", err
 			}
 			v := int64(binary.LittleEndian.Uint64(b))
-			// DateTime64 with default precision 3 (milliseconds)
 			return time.Unix(v/1000, (v%1000)*1000000).UTC().Format("2006-01-02 15:04:05.000"), nil
+		}
+		if strings.HasPrefix(typ, "DateTime(") {
+			b, err := readFixed(r, 4)
+			if err != nil {
+				return "", err
+			}
+			ts := binary.LittleEndian.Uint32(b)
+			return time.Unix(int64(ts), 0).UTC().Format("2006-01-02 15:04:05"), nil
 		}
 		return readString(r)
 	}

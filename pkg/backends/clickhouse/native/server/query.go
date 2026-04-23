@@ -16,7 +16,10 @@
 
 package server
 
-import "fmt"
+import (
+	"fmt"
+	"io"
+)
 
 // ClientQueryMsg contains the relevant fields from a ClientQuery packet.
 // We parse enough to extract the SQL but skip over the full client info
@@ -100,7 +103,7 @@ func skipClientInfo(r *protoReader, revision uint64) error {
 	// initial query start time (revision >= 54449)
 	if revision >= RevisionInitialQueryStart {
 		var b [8]byte
-		if _, err := r.Read(b[:]); err != nil {
+		if _, err := io.ReadFull(r, b[:]); err != nil {
 			return err
 		}
 	}
@@ -147,7 +150,7 @@ func skipClientInfo(r *protoReader, revision uint64) error {
 		if hasSpan != 0 {
 			// trace id (16) + span id (8) + trace state (string) + flags (1)
 			var skip [24]byte
-			if _, err := r.Read(skip[:]); err != nil {
+			if _, err := io.ReadFull(r, skip[:]); err != nil {
 				return err
 			}
 			if _, err := r.str(); err != nil {
