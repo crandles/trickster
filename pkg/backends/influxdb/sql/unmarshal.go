@@ -21,9 +21,9 @@ import (
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/trickstercache/trickster/v2/pkg/backends/influxdb/iofmt"
@@ -279,8 +279,7 @@ func coerceValue(v any, dt timeseries.FieldDataType) any {
 		if s, ok := v.(string); ok {
 			return s
 		}
-		return strings.TrimSpace(strings.Trim(strings.Trim(
-			strings.TrimSpace(v.(string)), "\""), "'"))
+		return fmt.Sprint(v)
 	}
 	return v
 }

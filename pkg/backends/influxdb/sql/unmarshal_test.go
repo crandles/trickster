@@ -113,6 +113,23 @@ func TestUnmarshalNilData(t *testing.T) {
 	}
 }
 
+func TestUnmarshalJSONNullThenNumeric(t *testing.T) {
+	data := []byte(`[{"time":"2024-01-01T00:00:00Z","temperature":null},{"time":"2024-01-01T01:00:00Z","temperature":72.5}]`)
+	trq := testTRQ()
+	ts, err := UnmarshalTimeseries(data, trq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds, ok := ts.(*dataset.DataSet)
+	if !ok {
+		t.Fatal("expected *dataset.DataSet")
+	}
+	pts := ds.Results[0].SeriesList[0].Points
+	if len(pts) != 2 {
+		t.Fatalf("expected 2 points, got %d", len(pts))
+	}
+}
+
 func TestRoundTripJSON(t *testing.T) {
 	ds := testDataSet()
 	rlo := &timeseries.RequestOptions{OutputFormat: 32} // V3OutputJSON
