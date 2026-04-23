@@ -37,7 +37,37 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"google.golang.org/grpc/metadata"
 )
+
+// tenantKey derives a stable per-tenant cache namespace from the incoming
+// gRPC metadata. client.withAuth forwards `authorization`, `database`, and
+// `bucket-name` to the upstream for per-request scoping, so cache keys must
+// mirror that scope to avoid returning one tenant's data to another.
+// Authorization is hashed so bearer tokens don't leak into cache keys.
+func tenantKey(ctx context.Context) string {
+	md, _ := metadata.FromIncomingContext(ctx)
+	db := mdFirst(md, "database")
+	bucket := mdFirst(md, "bucket-name")
+	auth := mdFirst(md, "authorization")
+	authPart := ""
+	if auth != "" {
+		sum := sha256.Sum256([]byte(auth))
+		authPart = hex.EncodeToString(sum[:8])
+	}
+	return db + "|" + bucket + "|" + authPart
+}
+
+func mdFirst(md metadata.MD, key string) string {
+	if md == nil {
+		return ""
+	}
+	v := md.Get(key)
+	if len(v) == 0 {
+		return ""
+	}
+	return v[0]
+}
 
 // Server is a Flight SQL server that acts as a caching proxy to an upstream
 // Flight SQL service (e.g., InfluxDB 3.x).
@@ -116,15 +146,16 @@ func (s *Server) DoGetStatement(ctx context.Context,
 	ticket flightsql.StatementQueryTicket,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	query := string(ticket.GetStatementHandle())
+	key := tenantKey(ctx) + ":stmt:" + query
 
-	ipcBytes, cached := s.cacheGet(query)
+	ipcBytes, cached := s.cacheGet(key)
 	if !cached {
 		b, err := s.upstream.Execute(ctx, query)
 		if err != nil {
 			return nil, nil, fmt.Errorf("upstream execute: %w", err)
 		}
 		ipcBytes = b
-		s.cacheSet(query, ipcBytes)
+		s.cacheSet(key, ipcBytes)
 	}
 
 	return streamIPCBytes(ipcBytes)
@@ -172,7 +203,8 @@ func (s *Server) GetFlightInfoCatalogs(_ context.Context,
 // DoGetCatalogs streams the upstream's catalog list (cache-first).
 func (s *Server) DoGetCatalogs(ctx context.Context,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	return s.fetchMetadata(ctx, "meta:catalogs", s.upstream.GetCatalogs)
+	return s.fetchMetadata(ctx, tenantKey(ctx)+":meta:catalogs",
+		s.upstream.GetCatalogs)
 }
 
 // GetFlightInfoSchemas returns a FlightInfo describing DB schemas.
@@ -190,7 +222,7 @@ func (s *Server) DoGetDBSchemas(ctx context.Context,
 		Catalog:               cmd.GetCatalog(),
 		DbSchemaFilterPattern: cmd.GetDBSchemaFilterPattern(),
 	}
-	key := "meta:dbschemas:" + strings.Join([]string{
+	key := tenantKey(ctx) + ":meta:dbschemas:" + strings.Join([]string{
 		deref(cmd.GetCatalog()),
 		deref(cmd.GetDBSchemaFilterPattern()),
 	}, "|")
@@ -222,7 +254,7 @@ func (s *Server) DoGetTables(ctx context.Context,
 		TableTypes:             tableTypes,
 		IncludeSchema:          cmd.GetIncludeSchema(),
 	}
-	key := "meta:tables:" + strings.Join([]string{
+	key := tenantKey(ctx) + ":meta:tables:" + strings.Join([]string{
 		deref(cmd.GetCatalog()),
 		deref(cmd.GetDBSchemaFilterPattern()),
 		deref(cmd.GetTableNameFilterPattern()),
@@ -244,7 +276,8 @@ func (s *Server) GetFlightInfoTableTypes(_ context.Context,
 // DoGetTableTypes streams the upstream's table types (cache-first).
 func (s *Server) DoGetTableTypes(ctx context.Context,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	return s.fetchMetadata(ctx, "meta:tabletypes", s.upstream.GetTableTypes)
+	return s.fetchMetadata(ctx, tenantKey(ctx)+":meta:tabletypes",
+		s.upstream.GetTableTypes)
 }
 
 // GetFlightInfoSqlInfo returns a FlightInfo describing SQL info. BaseServer's
@@ -269,7 +302,7 @@ func (s *Server) DoGetSqlInfo(ctx context.Context,
 	for i, v := range rawInfo {
 		info[i] = flightsql.SqlInfo(v)
 	}
-	return s.fetchMetadata(ctx, fmt.Sprintf("meta:sqlinfo:%v", rawInfo),
+	return s.fetchMetadata(ctx, fmt.Sprintf("%s:meta:sqlinfo:%v", tenantKey(ctx), rawInfo),
 		func(ctx context.Context) ([]byte, error) {
 			return s.upstream.GetSqlInfo(ctx, info)
 		})
@@ -349,7 +382,7 @@ func (s *Server) DoGetPreparedStatement(ctx context.Context,
 	cmd flightsql.PreparedStatementQuery,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	handle := cmd.GetPreparedStatementHandle()
-	key := "prep:" + string(handle) + ":" + s.paramHash(handle)
+	key := tenantKey(ctx) + ":prep:" + string(handle) + ":" + s.paramHash(handle)
 	return s.fetchMetadata(ctx, key, func(ctx context.Context) ([]byte, error) {
 		return s.upstream.ExecutePrepared(ctx, handle)
 	})

@@ -27,7 +27,19 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"google.golang.org/grpc/metadata"
 )
+
+func ctxWithTenant(auth, db string) context.Context {
+	md := metadata.MD{}
+	if auth != "" {
+		md.Set("authorization", auth)
+	}
+	if db != "" {
+		md.Set("database", db)
+	}
+	return metadata.NewIncomingContext(context.Background(), md)
+}
 
 // fakeUpstream is a simple UpstreamClient for tests that returns pre-canned IPC bytes.
 // All RPC methods return the same ipcBytes payload — tests only care about call
@@ -264,6 +276,85 @@ func TestDoGetStatement_CacheHit(t *testing.T) {
 
 	if up.callCount != 1 {
 		t.Errorf("expected 1 upstream call (2nd should hit cache), got %d", up.callCount)
+	}
+}
+
+func TestDoGetStatement_TenantIsolation(t *testing.T) {
+	ipcBytes := buildTestIPC(t)
+	up := &fakeUpstream{ipcBytes: ipcBytes}
+	srv := NewServer(up, newMemCache())
+	query := "SELECT * FROM cpu"
+	sqt := statementTicket(query)
+
+	ctxA := ctxWithTenant("Bearer tokenA", "tenant_a")
+	ctxB := ctxWithTenant("Bearer tokenB", "tenant_b")
+
+	_, ch, err := srv.DoGetStatement(ctxA, sqt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for chunk := range ch {
+		chunk.Data.Release()
+	}
+	_, ch2, err := srv.DoGetStatement(ctxB, sqt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for chunk := range ch2 {
+		chunk.Data.Release()
+	}
+
+	if up.executeCalls != 2 {
+		t.Errorf("expected 2 upstream Execute calls (one per tenant), got %d",
+			up.executeCalls)
+	}
+}
+
+func TestDoGetStatement_SameTenantHits(t *testing.T) {
+	ipcBytes := buildTestIPC(t)
+	up := &fakeUpstream{ipcBytes: ipcBytes}
+	srv := NewServer(up, newMemCache())
+	query := "SELECT * FROM cpu"
+	sqt := statementTicket(query)
+
+	ctx := ctxWithTenant("Bearer tokenA", "tenant_a")
+
+	for range 2 {
+		_, ch, err := srv.DoGetStatement(ctx, sqt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for chunk := range ch {
+			chunk.Data.Release()
+		}
+	}
+
+	if up.executeCalls != 1 {
+		t.Errorf("expected 1 upstream call (2nd hits cache), got %d",
+			up.executeCalls)
+	}
+}
+
+func TestDoGetCatalogs_TenantIsolation(t *testing.T) {
+	ipcBytes := buildTestIPC(t)
+	up := &fakeUpstream{ipcBytes: ipcBytes}
+	srv := NewServer(up, newMemCache())
+
+	ctxA := ctxWithTenant("Bearer tokenA", "tenant_a")
+	ctxB := ctxWithTenant("Bearer tokenB", "tenant_b")
+
+	for _, ctx := range []context.Context{ctxA, ctxB} {
+		_, ch, err := srv.DoGetCatalogs(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for chunk := range ch {
+			chunk.Data.Release()
+		}
+	}
+
+	if up.catalogCalls != 2 {
+		t.Errorf("expected 2 upstream GetCatalogs calls, got %d", up.catalogCalls)
 	}
 }
 
