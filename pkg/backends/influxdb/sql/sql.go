@@ -40,6 +40,11 @@ import (
 // Query holds the parsed and tokenized SQL query
 type Query struct {
 	TokenizedStatement string
+	// BaseTimestampFieldName is the underlying time column referenced inside a
+	// date_bin/date_trunc bucketing expression. When a SELECT alias is used
+	// (e.g. `date_bin(..., t) AS bucket`), the alias cannot appear in WHERE,
+	// so SetExtent must re-emit predicates against the base column instead.
+	BaseTimestampFieldName string
 }
 
 // V3InfluxQLQuery marks a parsed InfluxQL query as originating from the v3
@@ -164,7 +169,10 @@ func ParseTimeRangeQuery(r *http.Request, f iofmt.Format,
 		}
 		trq.BackfillTolerance = bf
 	}
-	trq.ParsedQuery = &Query{TokenizedStatement: trq.Statement}
+	trq.ParsedQuery = &Query{
+		TokenizedStatement:     trq.Statement,
+		BaseTimestampFieldName: ro.BaseTimestampFieldName,
+	}
 	trq.TemplateURL = urls.Clone(r.URL)
 	if isBody {
 		request.SetBody(r, []byte(trq.Statement))

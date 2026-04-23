@@ -34,7 +34,7 @@ func SetExtent(r *http.Request, trq *timeseries.TimeRangeQuery,
 	if extent == nil || r == nil || trq == nil || q == nil {
 		return
 	}
-	stmt := interpolateTimeQuery(q.TokenizedStatement, trq.TimestampDefinition, extent)
+	stmt := interpolateTimeQuery(q, trq.TimestampDefinition, extent)
 	isBody := methods.HasBody(r.Method)
 	if isBody {
 		request.SetBody(r, []byte(stmt))
@@ -45,13 +45,16 @@ func SetExtent(r *http.Request, trq *timeseries.TimeRangeQuery,
 	}
 }
 
-func interpolateTimeQuery(template string, tfd timeseries.FieldDefinition,
+func interpolateTimeQuery(q *Query, tfd timeseries.FieldDefinition,
 	extent *timeseries.Extent,
 ) string {
 	start, end := formatTimestampValues(tfd, extent)
 	tStart, tEnd := formatTimestampValues(
 		timeseries.FieldDefinition{ProviderData1: tfd.ProviderData1}, extent)
-	tsName := tfd.Name
+	tsName := q.BaseTimestampFieldName
+	if tsName == "" {
+		tsName = tfd.Name
+	}
 	if tsName == "" {
 		tsName = DefaultTimestampField
 	}
@@ -60,7 +63,7 @@ func interpolateTimeQuery(template string, tfd timeseries.FieldDefinition,
 		tkRange, trange,
 		tkTS1, tStart,
 		tkTS2, tEnd,
-	).Replace(template)
+	).Replace(q.TokenizedStatement)
 	return out
 }
 
