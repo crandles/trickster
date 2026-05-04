@@ -22,7 +22,7 @@ services:
     image: grafana/grafana:11.6.0
     user: nobody
     environment:
-      - GF_INSTALL_PLUGINS=vertamedia-clickhouse-datasource
+      - GF_INSTALL_PLUGINS=vertamedia-clickhouse-datasource,grafana-clickhouse-datasource
     volumes:
       - ./docker-compose-data/grafana-config:/etc/grafana
       - ./docker-compose-data/dashboards:/var/lib/grafana/dashboards
@@ -49,6 +49,7 @@ services:
       - '--storage.tsdb.path=/prometheus'
       - '--web.console.libraries=/usr/share/prometheus/console_libraries'
       - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--enable-feature=native-histograms'
     build:
       context: .
       network: host
