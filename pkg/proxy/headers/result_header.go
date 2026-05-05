@@ -146,7 +146,12 @@ func parseResultHeaderVals(h string) ResultHeaderParts {
 						k++
 					}
 				}
-				r.Fetched = el[:k]
+
+				if key == "fetched" {
+					r.Fetched = el[:k]
+				} else {
+					r.FailedFetch = el[:k]
+				}
 			}
 		}
 	}
