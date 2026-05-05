@@ -18,6 +18,7 @@ package headers
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,4 +83,49 @@ func TestParseResultHeaderVals(t *testing.T) {
 	}
 
 	// t.Error()
+}
+
+func TestParseResultHeaderValsFailed(t *testing.T) {
+	const in = "engine=DeltaProxyCache; status=proxy-error; failed=[1000-2000]"
+	const expected = "engine=DeltaProxyCache; status=proxy-error; failed=[1000-2000]"
+	if res := parseResultHeaderVals(in).String(); res != expected {
+		t.Errorf("expected %s got %s", expected, res)
+	}
+}
+
+func TestSetResultsHeaderWithFailed(t *testing.T) {
+	h := http.Header{}
+	SetResultsHeader(h, "test-engine", "test-status", "",
+		nil,
+		timeseries.ExtentList{timeseries.Extent{Start: time.Unix(1, 0), End: time.Unix(2, 0)}})
+	const expected = "engine=test-engine; status=test-status; failed=[1000-2000]"
+	if got := h.Get(NameTricksterResult); got != expected {
+		t.Errorf("expected %s got %s", expected, got)
+	}
+}
+
+func TestMergeResultHeaderValsFailedBothSides(t *testing.T) {
+	const h1 = "engine=DeltaProxyCache; status=proxy-error; failed=[1000-2000]"
+	const h2 = "engine=DeltaProxyCache; status=proxy-error; failed=[3000-4000]"
+
+	got := MergeResultHeaderVals(h1, h2)
+	if !strings.Contains(got, "1000-2000") {
+		t.Errorf("merged header missing first extent: %s", got)
+	}
+	if !strings.Contains(got, "3000-4000") {
+		t.Errorf("merged header missing second extent: %s", got)
+	}
+}
+
+func TestMergeResultHeaderValsFetchedBothSides(t *testing.T) {
+	const h1 = "engine=DeltaProxyCache; status=hit; fetched=[1000-2000]"
+	const h2 = "engine=DeltaProxyCache; status=hit; fetched=[3000-4000]"
+
+	got := MergeResultHeaderVals(h1, h2)
+	if !strings.Contains(got, "1000-2000") {
+		t.Errorf("merged header missing first extent: %s", got)
+	}
+	if !strings.Contains(got, "3000-4000") {
+		t.Errorf("merged header missing second extent: %s", got)
+	}
 }

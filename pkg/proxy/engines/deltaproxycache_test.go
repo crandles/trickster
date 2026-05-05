@@ -670,6 +670,75 @@ func TestDeltaProxyCacheRequestPartialHitWithFailedExtents(t *testing.T) {
 	t.Logf("Result Header: %s", resultHdr)
 }
 
+type firstCallFailureTransport struct {
+	inner http.RoundTripper
+	n     atomic.Int64
+}
+
+func (t *firstCallFailureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.n.Add(1) == 1 {
+		return &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Status:     "502 Bad Gateway",
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("upstream failure")),
+			Request:    req,
+		}, nil
+	}
+	return t.inner.RoundTrip(req)
+}
+
+func TestFetchTimeseriesShardedPartialFailure(t *testing.T) {
+	ts, w, r, rsc, err := setupTestHarnessDPC()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Close()
+
+	client := rsc.BackendClient.(*TestClient)
+	o := rsc.BackendOptions
+
+	o.FastForwardDisable = true
+	o.DoesShard = true
+	o.ShardStep = 1 * time.Hour
+	o.MaxShardSizeTime = 1 * time.Hour
+	o.MaxShardSizePoints = 0
+	o.FetchConcurrencyLimit = 1
+
+	step := 5 * time.Minute
+	now := time.Now()
+	end := now.Add(-12 * time.Hour)
+	extr := timeseries.Extent{Start: end.Add(-3 * time.Hour), End: end}
+
+	r.URL.Path = "/prometheus/api/v1/query_range"
+	r.URL.RawQuery = fmt.Sprintf("step=%d&start=%d&end=%d&query=%s",
+		int(step.Seconds()), extr.Start.Unix(), extr.End.Unix(), queryReturnsOKNoLatency)
+
+	origTransport := rsc.BackendOptions.HTTPClient.Transport
+	if origTransport == nil {
+		origTransport = http.DefaultTransport
+	}
+	rsc.BackendOptions.HTTPClient.Transport = &firstCallFailureTransport{inner: origTransport}
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			t.Errorf("partial shard failure caused panic in fetchTimeseries: %v", rec)
+		}
+	}()
+
+	client.QueryRangeHandler(w, r)
+	resp := w.Result()
+
+	if resp.StatusCode == 0 {
+		t.Errorf("no status code written")
+	}
+
+	resultHdr := resp.Header.Get(headers.NameTricksterResult)
+	if !strings.Contains(resultHdr, "failed=") {
+		t.Errorf("expected failed= in result header, got: %s", resultHdr)
+	}
+}
+
 func TestDeltayProxyCacheRequestDeltaFetchError(t *testing.T) {
 	ts, w, r, rsc, err := setupTestHarnessDPC()
 	if err != nil {
