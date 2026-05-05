@@ -814,16 +814,18 @@ func fetchExtents(
 }
 
 func trimEmptyExtents(failedExtents timeseries.ExtentList) timeseries.ExtentList {
-	var trimmedList timeseries.ExtentList
-	var emptyExtent = timeseries.Extent{}
+	trimmedList := make(timeseries.ExtentList, len(failedExtents))
+	emptyExtent := timeseries.Extent{}
 
+	var cursor int
 	for _, extent := range failedExtents {
 		if extent == emptyExtent {
 			continue
 		}
 
-		trimmedList = append(trimmedList, extent)
+		trimmedList[cursor] = extent
+		cursor++
 	}
 
-	return trimmedList
+	return trimmedList[:cursor]
 }
