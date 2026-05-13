@@ -35,7 +35,14 @@ func (b Backends) StartHealthChecks(knownStatuses healthcheck.StatusLookup) (hea
 	hc := healthcheck.New()
 	for k, c := range b {
 		bo := c.Configuration()
-		if IsVirtual(bo.Provider) || k == "frontend" {
+		if k == "frontend" {
+			continue
+		}
+		if IsVirtual(bo.Provider) {
+			// Virtual backends have no upstream to probe; register a synthetic
+			// passing status so nested ALBs surface in the health page and in
+			// outer pools' availablePoolMembers (issue #996).
+			hc.RegisterVirtual(k, bo.Provider)
 			continue
 		}
 		hco := bo.HealthCheck

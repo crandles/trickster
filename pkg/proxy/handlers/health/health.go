@@ -246,6 +246,15 @@ func updateStatusText(now func() time.Time, hc healthcheck.HealthChecker, hd *he
 	var al, ul, il, ql int
 
 	for k, v := range st {
+		// Virtual backends (alb, rule) carry a synthetic status only so they
+		// surface in outer ALB pool reporting; they have their own per-ALB
+		// section below and would duplicate as plain entries here.
+		if b, ok := backends[k]; ok && b != nil && b.Configuration() != nil {
+			p := b.Configuration().Provider
+			if p == providers.ALB || p == providers.Rule {
+				continue
+			}
+		}
 		switch v.Get() {
 		case healthcheck.StatusPassing:
 			a[al] = k

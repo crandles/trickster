@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"slices"
 	"sync"
+	"time"
 
 	ho "github.com/trickstercache/trickster/v2/pkg/backends/healthcheck/options"
 )
@@ -30,6 +31,10 @@ import (
 type HealthChecker interface {
 	// Register a health check Target
 	Register(name string, description string, options *ho.Options, client *http.Client) (*Status, error)
+	// RegisterVirtual records a synthetic always-passing Status for a virtual
+	// backend (rule, alb) that has no upstream to probe. Without this,
+	// nested ALBs render as "nc" on the health page (issue #996).
+	RegisterVirtual(name, description string) *Status
 	// Remove a health check Target
 	Unregister(name string)
 	// Resolve status of named Target
@@ -112,6 +117,14 @@ func (hc *healthChecker) Register(name, description string, o *ho.Options,
 		t.Start(context.Background())
 	}
 	return t.status, nil
+}
+
+func (hc *healthChecker) RegisterVirtual(name, description string) *Status {
+	s := NewStatus(name, description, "", StatusPassing, time.Time{}, nil)
+	hc.mtx.Lock()
+	hc.statuses[name] = s
+	hc.mtx.Unlock()
+	return s
 }
 
 func (hc *healthChecker) Unregister(name string) {
