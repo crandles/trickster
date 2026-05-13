@@ -248,7 +248,7 @@ func DeltaProxyCacheRequest(w http.ResponseWriter, r *http.Request, modeler *tim
 	}
 
 	client.SetExtent(pr.upstreamRequest, trq, &trq.Extent)
-	key := o.CacheKeyPrefix + ".dpc." + pr.DeriveCacheKey("")
+	key := ComposeCacheKey(o.Name, o.CacheKeyPrefix, "dpc", pr.DeriveCacheKey(""))
 
 	coReq := GetRequestCachingPolicy(r.Header)
 

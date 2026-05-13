@@ -43,7 +43,8 @@ func TestHandleFirstResponse(t *testing.T) {
 	r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
 
 	p, _, _ := albpool.New(0, nil)
-	h := &handler{pool: p}
+	h := &handler{}
+	h.SetPool(p)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusBadGateway {
@@ -51,8 +52,9 @@ func TestHandleFirstResponse(t *testing.T) {
 	}
 
 	var st []*healthcheck.Status
-	h.pool, _, st = albpool.New(-1,
+	p, _, st = albpool.New(-1,
 		[]http.Handler{http.HandlerFunc(tu.BasicHTTPHandler)})
+	h.SetPool(p)
 	st[0].Set(0)
 	time.Sleep(250 * time.Millisecond)
 
@@ -62,11 +64,12 @@ func TestHandleFirstResponse(t *testing.T) {
 		t.Error("expected 200 got", w.Code)
 	}
 
-	h.pool, _, st = albpool.New(-1,
+	p, _, st = albpool.New(-1,
 		[]http.Handler{
 			http.HandlerFunc(tu.BasicHTTPHandler),
 			http.HandlerFunc(tu.BasicHTTPHandler),
 		})
+	h.SetPool(p)
 	st[0].Set(0)
 	st[1].Set(0)
 	time.Sleep(250 * time.Millisecond)
@@ -122,7 +125,8 @@ func TestFirstGoodResponse(t *testing.T) {
 		st[1].Set(0)
 		time.Sleep(250 * time.Millisecond)
 
-		h := &handler{pool: p, fgr: true}
+		h := &handler{fgr: true}
+		h.SetPool(p)
 		w := httptest.NewRecorder()
 		r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
 		h.ServeHTTP(w, r)
@@ -143,7 +147,8 @@ func TestFirstGoodResponse(t *testing.T) {
 		st[1].Set(0)
 		time.Sleep(250 * time.Millisecond)
 
-		h := &handler{pool: p, fgr: true, fgrCodes: codes}
+		h := &handler{fgr: true, fgrCodes: codes}
+		h.SetPool(p)
 		w := httptest.NewRecorder()
 		r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
 		h.ServeHTTP(w, r)
@@ -162,7 +167,8 @@ func TestFirstGoodResponse(t *testing.T) {
 		st[1].Set(0)
 		time.Sleep(250 * time.Millisecond)
 
-		h := &handler{pool: p, fgr: true}
+		h := &handler{fgr: true}
+		h.SetPool(p)
 		w := httptest.NewRecorder()
 		r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
 		h.ServeHTTP(w, r)
@@ -184,7 +190,8 @@ func TestFirstGoodResponse(t *testing.T) {
 		}
 		time.Sleep(250 * time.Millisecond)
 
-		h := &handler{pool: p, fgr: true}
+		h := &handler{fgr: true}
+		h.SetPool(p)
 		w := httptest.NewRecorder()
 		r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
 		h.ServeHTTP(w, r)
@@ -204,7 +211,8 @@ func TestFirstGoodResponse(t *testing.T) {
 		}
 		time.Sleep(250 * time.Millisecond)
 
-		h := &handler{pool: p, fgr: true}
+		h := &handler{fgr: true}
+		h.SetPool(p)
 		w := httptest.NewRecorder()
 		r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
 		h.ServeHTTP(w, r)
@@ -212,6 +220,37 @@ func TestFirstGoodResponse(t *testing.T) {
 			t.Errorf("expected 4xx/5xx fallback, got %d", w.Code)
 		}
 	})
+}
+
+func TestFGRFallbackEmits502WhenNoMemberQualifies(t *testing.T) {
+	statusHandler := func(code int, body string) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(code)
+			w.Write([]byte(body))
+		})
+	}
+
+	codes := sets.New([]int{http.StatusOK})
+	p, _, st := albpool.New(-1, []http.Handler{
+		statusHandler(http.StatusInternalServerError, "body0"),
+		statusHandler(http.StatusInternalServerError, "body1"),
+	})
+	st[0].Set(0)
+	st[1].Set(0)
+	time.Sleep(250 * time.Millisecond)
+
+	h := &handler{fgr: true, fgrCodes: codes}
+	h.SetPool(p)
+	w := httptest.NewRecorder()
+	r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("expected 502 got %d (body %q)", w.Code, w.Body.String())
+	}
+	if body := w.Body.String(); body == "body0" || body == "body1" {
+		t.Errorf("fallback served disqualified upstream body %q", body)
+	}
 }
 
 // TestHandleFirstResponseContextCancel verifies that cancelling the request
@@ -231,7 +270,8 @@ func TestHandleFirstResponseContextCancel(t *testing.T) {
 		p, _, _ := albpool.New(-1, []http.Handler{slow, slow})
 		p.SetHealthy([]http.Handler{slow, slow})
 
-		h := &handler{pool: p}
+		h := &handler{}
+		h.SetPool(p)
 		ctx, cancel := context.WithCancel(context.Background())
 		r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
 		r = r.WithContext(ctx)
@@ -277,7 +317,8 @@ func TestHandleFirstResponseContextCancel_50Backends(t *testing.T) {
 		p, _, _ := albpool.New(-1, hs)
 		p.SetHealthy(hs)
 
-		h := &handler{pool: p}
+		h := &handler{}
+		h.SetPool(p)
 		ctx, cancel := context.WithCancel(context.Background())
 		r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
 		r = r.WithContext(ctx)

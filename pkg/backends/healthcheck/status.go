@@ -75,7 +75,7 @@ func (s *Status) String() string {
 		fmt.Fprintf(sb, "detail: %s\n", s.Detail())
 	}
 	if st == StatusFailing {
-		fmt.Fprintf(sb, "since: %d", s.failingSince.Unix())
+		fmt.Fprintf(sb, "since: %d", s.FailingSince().Unix())
 	}
 	return sb.String()
 }
@@ -136,7 +136,17 @@ func (s *Status) Description() string {
 
 // FailingSince provides the failing since time
 func (s *Status) FailingSince() time.Time {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
 	return s.failingSince
+}
+
+// SetFailingSince updates the failing since time. Used by the probe loop
+// when it transitions a target into or out of the StatusFailing state.
+func (s *Status) SetFailingSince(t time.Time) {
+	s.mtx.Lock()
+	s.failingSince = t
+	s.mtx.Unlock()
 }
 
 // RegisterSubscriber registers a subscriber with the Status
@@ -147,4 +157,14 @@ func (s *Status) RegisterSubscriber(ch chan bool) {
 	}
 	s.subscribers = append(s.subscribers, ch)
 	s.mtx.Unlock()
+}
+
+// UnregisterSubscriber removes a previously-registered channel. No-op if ch
+// was not registered.
+func (s *Status) UnregisterSubscriber(ch chan bool) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	s.subscribers = slices.DeleteFunc(s.subscribers, func(c chan bool) bool {
+		return c == ch
+	})
 }

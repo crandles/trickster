@@ -87,7 +87,7 @@ func DoProxy(w io.Writer, r *http.Request, closeResponse bool) *http.Response {
 		}
 	} else {
 		pr := newProxyRequest(r, w)
-		key := o.CacheKeyPrefix + "." + pr.DeriveCacheKey("")
+		key := ComposeCacheKey(o.Name, o.CacheKeyPrefix, "", pr.DeriveCacheKey(""))
 		result, ok := reqs.Load(key)
 		if !ok {
 			var contentLength int64

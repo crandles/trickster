@@ -21,14 +21,22 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+
+	"github.com/trickstercache/trickster/v2/pkg/backends/healthcheck"
 )
 
 // Pool defines the interface for a load balancer pool
 type Pool interface {
 	// Healthy returns the full list of Healthy Targets as http.Handlers
 	Healthy() []http.Handler
-	// HealthyTargets returns the full list of Healthy Targets as *Targets
+	// HealthyTargets returns the snapshot of Healthy Targets. Snapshots can
+	// lag behind atomic status flips; callers that dispatch traffic should
+	// prefer LiveTargets.
 	HealthyTargets() Targets
+	// LiveTargets returns the snapshot of Healthy Targets re-filtered against
+	// each target's current hcStatus. This closes the race window between
+	// an atomic status flip and the asynchronous healthy-list refresh.
+	LiveTargets() Targets
 	// SetHealthy sets the Healthy Targets List
 	SetHealthy([]http.Handler)
 	// Stop stops the pool and its health checker goroutines
@@ -69,6 +77,9 @@ func (p *pool) RefreshHealthy() {
 
 	var k int
 	for _, t := range p.targets {
+		if t == nil || t.hcStatus == nil {
+			continue
+		}
 		if int(t.hcStatus.Get()) >= p.healthyFloor {
 			hh[k] = t.handler
 			ht[k] = t
@@ -97,16 +108,41 @@ func (p *pool) Healthy() []http.Handler {
 	return nil
 }
 
+func (p *pool) LiveTargets() Targets {
+	hl := p.HealthyTargets()
+	live := make(Targets, 0, len(hl))
+	for _, t := range hl {
+		if t == nil || int(t.hcStatus.Get()) < p.healthyFloor {
+			continue
+		}
+		live = append(live, t)
+	}
+	return live
+}
+
 func (p *pool) SetHealthy(h []http.Handler) {
 	p.healthyHandlers.Store(&h)
+	// Materialize parallel Targets each backed by a synthetic Passing status
+	// so dispatch-time re-checks against HealthyFloor won't reject them.
 	t := make(Targets, len(h))
+	for i, hh := range h {
+		st := &healthcheck.Status{}
+		st.Set(healthcheck.StatusPassing)
+		t[i] = NewTarget(hh, st, nil)
+	}
 	p.healthyTargets.Store(&t)
 }
 
 func (p *pool) Stop() {
 	select {
 	case <-p.done:
+		// already stopped
 	default:
 		close(p.done)
+		for _, t := range p.targets {
+			if t != nil && t.hcStatus != nil {
+				t.hcStatus.UnregisterSubscriber(p.statusCh)
+			}
+		}
 	}
 }

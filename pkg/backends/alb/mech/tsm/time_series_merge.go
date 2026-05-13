@@ -19,10 +19,12 @@ package tsm
 import (
 	stderrors "errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/trickstercache/trickster/v2/pkg/backends"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/errors"
+	"github.com/trickstercache/trickster/v2/pkg/backends/alb/mech"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/mech/rr"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/mech/types"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/names"
@@ -50,7 +52,7 @@ const (
 )
 
 type handler struct {
-	pool            pool.Pool
+	mech.PoolHolder
 	mergePaths      []string        // paths handled by the alb client that are enabled for tsmerge
 	nonmergeHandler types.Mechanism // when methodology is tsmerge, this handler is for non-mergeable paths
 	outputFormat    string          // the provider output format (e.g., "prometheus")
@@ -102,27 +104,28 @@ func (h *handler) Name() types.Name {
 	return ShortName
 }
 
+// SetPool overrides PoolHolder.SetPool to also propagate the pool to the
+// non-merge handler used for paths that bypass the TSM merge path.
 func (h *handler) SetPool(p pool.Pool) {
-	h.pool = p
-	h.nonmergeHandler.SetPool(p)
+	h.PoolHolder.SetPool(p)
+	if h.nonmergeHandler != nil {
+		h.nonmergeHandler.SetPool(p)
+	}
 }
 
 func (h *handler) StopPool() {
-	if h.pool != nil {
-		h.pool.Stop()
+	if p := h.Pool(); p != nil {
+		p.Stop()
 	}
-}
-
-func (h *handler) Pool() pool.Pool {
-	return h.pool
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.pool == nil {
+	p := h.Pool()
+	if p == nil {
 		failures.HandleBadGateway(w, r)
 		return
 	}
-	hl := h.pool.HealthyTargets() // should return a fanout list
+	hl := p.LiveTargets() // should return a fanout list
 	l := len(hl)
 	if l == 0 {
 		failures.HandleBadGateway(w, r)
@@ -140,10 +143,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defaultHandler.ServeHTTP(w, r)
 		return
 	}
-	// just proxy 1:1 if no folds in the fan or if there
-	// are no merge functions attached to the request
+	// just proxy 1:1 if there's no per-request resources object;
+	// the single-member shortcut is decided after stripKeys is computed
+	// so we don't bypass label-stripping for solo pools (D1).
 	rsc := request.GetResources(r)
-	if rsc == nil || l == 1 {
+	if rsc == nil {
 		defaultHandler.ServeHTTP(w, r)
 		return
 	}
@@ -227,6 +231,15 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Single-member fast path: only safe when there's nothing to strip and
+	// the strategy is plain dedup. Otherwise the merge path is still needed
+	// to apply StripTags or the dual-query rewrite to the lone backend's
+	// response (D1).
+	if l == 1 && len(stripKeys) == 0 && mergeStrategy == dataset.MergeStrategyDedup && !needsDualQuery {
+		defaultHandler.ServeHTTP(w, r)
+		return
+	}
+
 	if needsDualQuery {
 		h.serveWeightedAvg(w, r, hl, rsc, mp, query, stripKeys)
 		return
@@ -234,6 +247,37 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Standard scatter/gather for all non-avg strategies.
 	h.serveStandard(w, r, hl, rsc, mergeStrategy, stripKeys, warnMsg)
+}
+
+// gatherResult captures the per-member fanout outcome used to assemble the
+// merged response (status, headers, and the RespondFunc that knows how to
+// marshal the accumulator). failed flags a goroutine-level failure (e.g.
+// unsupported Content-Encoding, parse error) where the member produced no
+// usable contribution to the accumulator even though no HTTP error code
+// reached this layer.
+type gatherResult struct {
+	statusCode int
+	header     http.Header
+	mergeFunc  merge.RespondFunc
+	failed     bool
+}
+
+// pickWinner chooses which member's RespondFunc and headers feed the outbound
+// response. A 2xx member is preferred over a non-2xx one so a successful
+// member's body wins over an error envelope from an earlier-indexed shard
+// (V2). Falls back to the first non-nil entry when no 2xx exists.
+func pickWinner(results []gatherResult) (merge.RespondFunc, http.Header) {
+	for _, res := range results {
+		if res.mergeFunc != nil && res.statusCode >= 200 && res.statusCode < 300 {
+			return res.mergeFunc, res.header
+		}
+	}
+	for _, res := range results {
+		if res.mergeFunc != nil {
+			return res.mergeFunc, res.header
+		}
+	}
+	return nil, nil
 }
 
 // serveStandard handles the common scatter/gather path: each shard gets one
@@ -247,7 +291,6 @@ func (h *handler) serveStandard(
 	warnMsg string,
 ) {
 	l := len(hl)
-	var mrf merge.RespondFunc
 
 	accumulator := merge.NewAccumulator()
 	var eg errgroup.Group
@@ -255,20 +298,19 @@ func (h *handler) serveStandard(
 		eg.SetLimit(limit)
 	}
 
-	type result struct {
-		statusCode int
-		header     http.Header
-		mergeFunc  merge.RespondFunc
-	}
-	results := make([]result, l)
+	results := make([]gatherResult, l)
 
 	for i := range l {
 		if hl[i] == nil {
 			continue
 		}
 		eg.Go(func() error {
+			// recover so a single bad upstream doesn't crash the proxy; mark
+			// the slot failed so partial-failure surfacing fires downstream
+			defer mech.RecoverFanoutPanic("tsm", i, func() { results[i] = gatherResult{failed: true} })
 			r2, err := request.CloneWithoutResources(r)
 			if err != nil {
+				results[i].failed = true
 				return err
 			}
 			rsc2 := &request.Resources{
@@ -281,6 +323,7 @@ func (h *handler) serveStandard(
 			hl[i].Handler().ServeHTTP(crw, r2)
 			rsc2 = request.GetResources(r2)
 			if rsc2 == nil {
+				results[i].failed = true
 				return stderrors.New("tsm gather failed due to nil resources")
 			}
 			// ensure merge functions are set on cloned request
@@ -296,15 +339,18 @@ func (h *handler) serveStandard(
 			}
 			// as soon as response is complete, unmarshal and merge
 			// this happens in parallel for each response as it arrives
+			var contributed bool
 			if rsc2.MergeFunc != nil {
 				if rsc2.TS != nil {
 					rsc2.MergeFunc(accumulator, rsc2.TS, i)
+					contributed = true
 				} else {
 					body, err := encoding.DecompressResponseBody(
 						crw.Header().Get(headers.NameContentEncoding),
 						crw.Body(),
 					)
 					if err != nil {
+						results[i].failed = true
 						return err
 					}
 					if len(body) > 0 {
@@ -312,13 +358,33 @@ func (h *handler) serveStandard(
 						// populated. Fall back to passing the captured response body to
 						// MergeFunc, which handles []byte input via JSON unmarshal.
 						rsc2.MergeFunc(accumulator, body, i)
+						contributed = true
 					}
 				}
 			}
-			results[i] = result{
-				statusCode: crw.StatusCode(),
+			// rsc2.Response carries the upstream's true status code (set by
+			// ObjectProxyCacheRequest for merge members). The CRW status can
+			// stay at the default 200 when the per-shard handler unmarshals
+			// an error envelope but writes nothing through the outer writer
+			// (see prometheus.processVectorTransformations + MarshalTSOrVectorWriter
+			// returning ErrUnknownFormat for zero-result error responses).
+			// Without this fallback, mixed 2xx/5xx fanouts look uniformly OK
+			// to TSM and the partial-hit detection below misses (V2).
+			sc := crw.StatusCode()
+			if rsc2.Response != nil && rsc2.Response.StatusCode > 0 {
+				sc = rsc2.Response.StatusCode
+			}
+			results[i] = gatherResult{
+				statusCode: sc,
 				header:     crw.Header(),
 				mergeFunc:  rsc2.MergeRespondFunc,
+				// A member that wrote no contribution to the accumulator is
+				// a silent failure: typically the per-member handler hit a
+				// proxy-error (e.g. unsupported Content-Encoding decoded
+				// upstream then unmarshal failed) and surfaced 200 + empty
+				// body to us. Without this, the merged response would look
+				// identical to a fully-successful fanout.
+				failed: !contributed,
 			}
 			return nil
 		})
@@ -327,6 +393,23 @@ func (h *handler) serveStandard(
 	// wait for all fanout requests to complete
 	if err := eg.Wait(); err != nil {
 		logger.Warn("tsm gather failure", logging.Pairs{"error": err})
+	}
+
+	// Surface goroutine-level failures (e.g. unsupported Content-Encoding,
+	// parse error) where a member produced no contribution but no HTTP
+	// status reached this layer. Without this, the merged response would
+	// silently look identical to a fully-successful fanout.
+	var hasGatherFailure bool
+	for i, res := range results {
+		if res.failed {
+			hasGatherFailure = true
+			if ts := accumulator.GetTSData(); ts != nil {
+				if ds, ok := ts.(*dataset.DataSet); ok {
+					ds.Warnings = append(ds.Warnings,
+						"trickster: tsm partial failure: pool member "+strconv.Itoa(i)+" returned no usable response")
+				}
+			}
+		}
 	}
 
 	// For non-supportable aggregators, inject a warning into the Prometheus
@@ -339,22 +422,24 @@ func (h *handler) serveStandard(
 		}
 	}
 
-	var statusCode int
-	var statusHeader string
 	// winnerHeaders carries custom response headers (e.g. those set by a
 	// pool member's path override via response_headers:) from the same
 	// member whose mergeFunc will write the final response. Without this,
 	// TSM fanout would strip any backend-set headers that FGR would
 	// happily propagate. See #970.
-	var winnerHeaders http.Header
+	mrf, winnerHeaders := pickWinner(results)
+	var statusCode int
+	var statusHeader string
+	var has2xx, hasNon2xx bool
 	for _, res := range results {
-		if mrf == nil {
-			mrf = res.mergeFunc
-			winnerHeaders = res.header
-		}
 		if res.statusCode > 0 {
 			if statusCode == 0 || res.statusCode < statusCode {
 				statusCode = res.statusCode
+			}
+			if res.statusCode >= 200 && res.statusCode < 300 {
+				has2xx = true
+			} else {
+				hasNon2xx = true
 			}
 		}
 		if res.header != nil {
@@ -363,6 +448,18 @@ func (h *handler) serveStandard(
 				res.header.Get(headers.NameTricksterResult))
 		}
 	}
+	// Mixed 2xx + non-2xx fanout: surface a partial-hit marker so clients
+	// can detect that some members failed even when each member's own
+	// Trickster status string happens to agree (V2). hasGatherFailure
+	// extends this to silent goroutine failures (e.g. unsupported
+	// Content-Encoding) where the member returned 200 but produced no
+	// usable contribution to the merged result.
+	if (has2xx && hasNon2xx) || (hasGatherFailure && has2xx) {
+		statusHeader = headers.MergeResultHeaderVals(statusHeader, "engine=ALB; status=phit")
+	}
+
+	// preserve Set-Cookie from all members; headers.Merge below would otherwise collapse to winner only
+	mergeMultiValuedHeaders(w.Header(), results, winnerHeaders)
 
 	// Carry the winner's custom headers onto the outbound response BEFORE
 	// setting the aggregated X-Trickster-Result. headers.Merge makes the
@@ -386,6 +483,25 @@ func (h *handler) serveStandard(
 	}
 	if mrf != nil {
 		mrf(w, r, accumulator, statusCode)
+	}
+}
+
+// mergeMultiValuedHeaders appends every member's Set-Cookie values onto dst
+// and clears Set-Cookie on winnerHeaders so the subsequent headers.Merge
+// (which uses Set semantics) doesn't collapse them. RFC 6265 allows multiple
+// Set-Cookie response headers; Warning (RFC 7234) is similar but no current
+// backend sets it.
+func mergeMultiValuedHeaders(dst http.Header, results []gatherResult, winnerHeaders http.Header) {
+	for _, res := range results {
+		if res.header == nil {
+			continue
+		}
+		for _, v := range res.header.Values(headers.NameSetCookie) {
+			dst.Add(headers.NameSetCookie, v)
+		}
+	}
+	if winnerHeaders != nil {
+		winnerHeaders.Del(headers.NameSetCookie)
 	}
 }
 
@@ -421,12 +537,10 @@ func (h *handler) serveWeightedAvg(
 		eg.SetLimit(limit * 2)
 	}
 
-	type result struct {
-		statusCode int
-		header     http.Header
-		mergeFunc  merge.RespondFunc // from the sum query (used to write the final response)
-	}
-	results := make([]result, l)
+	// results captures sum-query outcomes only — the response envelope
+	// (status, headers, RespondFunc) comes from the sum side; count results
+	// affect the arithmetic, not the envelope.
+	results := make([]gatherResult, l)
 
 	for i := range l {
 		if hl[i] == nil {
@@ -434,6 +548,9 @@ func (h *handler) serveWeightedAvg(
 		}
 		// Sum query for shard i — clone from the pre-rewritten base request.
 		eg.Go(func() error {
+			// recover so a single bad upstream doesn't crash the proxy; mark
+			// the slot failed so partial-failure surfacing fires downstream
+			defer mech.RecoverFanoutPanic("tsm/avg-sum", i, func() { results[i] = gatherResult{failed: true} })
 			r2, err := request.CloneWithoutResources(sumBase)
 			if err != nil {
 				return err
@@ -458,8 +575,13 @@ func (h *handler) serveWeightedAvg(
 			if rsc2.MergeFunc != nil && rsc2.TS != nil {
 				rsc2.MergeFunc(sumAccum, rsc2.TS, i)
 			}
-			results[i] = result{
-				statusCode: crw.StatusCode(),
+			// See serveStandard for why we prefer rsc2.Response.StatusCode.
+			sc := crw.StatusCode()
+			if rsc2.Response != nil && rsc2.Response.StatusCode > 0 {
+				sc = rsc2.Response.StatusCode
+			}
+			results[i] = gatherResult{
+				statusCode: sc,
 				header:     crw.Header(),
 				mergeFunc:  rsc2.MergeRespondFunc,
 			}
@@ -468,6 +590,10 @@ func (h *handler) serveWeightedAvg(
 
 		// Count query for shard i — clone from the pre-rewritten base request.
 		eg.Go(func() error {
+			// recover so a single bad upstream doesn't crash the proxy; the
+			// count side doesn't own the response envelope, so we don't touch
+			// results[i] here — the sum-side recover handles that
+			defer mech.RecoverFanoutPanic("tsm/avg-count", i, nil)
 			r2, err := request.CloneWithoutResources(countBase)
 			if err != nil {
 				return err
@@ -500,34 +626,54 @@ func (h *handler) serveWeightedAvg(
 		logger.Warn("tsm weighted-avg gather failure", logging.Pairs{"error": err})
 	}
 
-	// Finalize: divide sum totals by count totals to obtain the weighted average.
+	// Finalize: divide sum totals by count totals to obtain the weighted
+	// average. If either side fanned out to zero usable responses the
+	// surviving accumulator is unfinalized and not a true average — surface
+	// that to the client via a Prometheus warning rather than returning
+	// silently-wrong numbers (D2).
 	sumTS := sumAccum.GetTSData()
 	countTS := countAccum.GetTSData()
-	if sumTS != nil && countTS != nil {
+	const (
+		warnCountFailed = "trickster: weighted-avg count fanout returned no usable responses; values are unfinalized sums and not a true average"
+		warnSumFailed   = "trickster: weighted-avg sum fanout returned no usable responses; values are unfinalized counts and not a true average"
+	)
+	switch {
+	case sumTS != nil && countTS != nil:
 		if sumDS, ok := sumTS.(*dataset.DataSet); ok {
 			if countDS, ok := countTS.(*dataset.DataSet); ok {
 				sumDS.FinalizeWeightedAvg(countDS, query)
 			}
 		}
+	case sumTS != nil && countTS == nil:
+		if sumDS, ok := sumTS.(*dataset.DataSet); ok {
+			sumDS.Warnings = append(sumDS.Warnings, warnCountFailed)
+		}
+	case sumTS == nil && countTS != nil:
+		// Promote countTS into the response slot so the client sees a body
+		// (with a warning) instead of nothing. The sum-side mrf still
+		// writes — it just marshals whichever DataSet the accumulator now
+		// holds.
+		if countDS, ok := countTS.(*dataset.DataSet); ok {
+			countDS.Warnings = append(countDS.Warnings, warnSumFailed)
+		}
+		sumAccum.SetTSData(countTS)
 	}
 
 	// Aggregate status and headers from sum-query results (count results are
 	// only used for the arithmetic and do not affect the response envelope).
-	var mrf merge.RespondFunc
+	mrf, winnerHeaders := pickWinner(results)
 	var statusCode int
 	var statusHeader string
-	// See serveStandard for the rationale — carry the winner's custom
-	// response headers through the fanout so backend-set headers like
-	// `X-Test-Origin` survive the merge. (#970)
-	var winnerHeaders http.Header
+	var has2xx, hasNon2xx bool
 	for _, res := range results {
-		if mrf == nil {
-			mrf = res.mergeFunc
-			winnerHeaders = res.header
-		}
 		if res.statusCode > 0 {
 			if statusCode == 0 || res.statusCode < statusCode {
 				statusCode = res.statusCode
+			}
+			if res.statusCode >= 200 && res.statusCode < 300 {
+				has2xx = true
+			} else {
+				hasNon2xx = true
 			}
 		}
 		if res.header != nil {
@@ -536,7 +682,14 @@ func (h *handler) serveWeightedAvg(
 				res.header.Get(headers.NameTricksterResult))
 		}
 	}
+	if has2xx && hasNon2xx {
+		statusHeader = headers.MergeResultHeaderVals(statusHeader, "engine=ALB; status=phit")
+	}
 
+	// See serveStandard for the rationale -- carry the winner's custom
+	// response headers through the fanout so backend-set headers like
+	// `X-Test-Origin` survive the merge. (#970)
+	mergeMultiValuedHeaders(w.Header(), results, winnerHeaders)
 	if winnerHeaders != nil {
 		headers.Merge(w.Header(), winnerHeaders)
 	}

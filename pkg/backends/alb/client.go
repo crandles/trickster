@@ -19,6 +19,7 @@ package alb
 import (
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/trickstercache/trickster/v2/pkg/backends"
 	alberr "github.com/trickstercache/trickster/v2/pkg/backends/alb/errors"
@@ -154,7 +155,7 @@ func (c *Client) ValidateAndStartPool(clients backends.Backends, hcs healthcheck
 		return err
 	}
 	if o.MechanismName == names.MechanismUR && o.UserRouter != nil {
-		return c.validateAndStartUserRouter(clients)
+		return c.validateAndStartUserRouter(clients, hcs)
 	}
 	targets := make(pool.Targets, 0, len(o.Pool))
 	for _, n := range o.Pool {
@@ -164,7 +165,8 @@ func (c *Client) ValidateAndStartPool(clients backends.Backends, hcs healthcheck
 		}
 		hc, ok := hcs[n]
 		if !ok {
-			continue // virtual backends (rule, alb) don't currently have health checks
+			// virtual backends (rule, alb) have no health checks; treat as passing
+			hc = healthcheck.NewStatus(n, "virtual", "", healthcheck.StatusPassing, time.Time{}, nil)
 		}
 		targets = append(targets, pool.NewTarget(tc.Router(), hc, tc))
 	}
@@ -178,7 +180,7 @@ func observeOnlyOpts() *authopt.Options {
 	return &authopt.Options{ObserveOnly: true}
 }
 
-func (c *Client) validateAndStartUserRouter(clients backends.Backends) error {
+func (c *Client) validateAndStartUserRouter(clients backends.Backends, hcs healthcheck.StatusLookup) error {
 	conf := c.Configuration()
 	var canReplaceCreds bool
 	o := conf.ALBOptions.UserRouter
@@ -238,6 +240,9 @@ func (c *Client) validateAndStartUserRouter(clients backends.Backends) error {
 				return alberr.NewErrInvalidBackendName(c.Name(), m.ToBackend)
 			}
 			m.ToHandler = bh.Router()
+			if hc, ok := hcs[m.ToBackend]; ok {
+				m.ToStatus = hc
+			}
 		}
 		if !canReplaceCreds && m.ToCredential != "" {
 			return alberr.NewErrInvalidUserRouterCreds(c.Name())

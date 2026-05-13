@@ -22,10 +22,10 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/trickstercache/trickster/v2/pkg/backends/alb/mech"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/mech/types"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/names"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/options"
-	"github.com/trickstercache/trickster/v2/pkg/backends/alb/pool"
 	rt "github.com/trickstercache/trickster/v2/pkg/backends/providers/registry/types"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/handlers/trickster/failures"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/headers"
@@ -44,7 +44,7 @@ const (
 )
 
 type handler struct {
-	pool     pool.Pool
+	mech.PoolHolder
 	fgr      bool
 	fgrCodes sets.Set[int]
 	options  options.FirstGoodResponseOptions
@@ -70,14 +70,6 @@ func New(_ *options.Options, _ rt.Lookup) (types.Mechanism, error) {
 	return &handler{}, nil
 }
 
-func (h *handler) SetPool(p pool.Pool) {
-	h.pool = p
-}
-
-func (h *handler) Pool() pool.Pool {
-	return h.pool
-}
-
 func (h *handler) ID() types.ID {
 	if h.fgr {
 		return FGRID
@@ -93,17 +85,18 @@ func (h *handler) Name() types.Name {
 }
 
 func (h *handler) StopPool() {
-	if h.pool != nil {
-		h.pool.Stop()
+	if p := h.Pool(); p != nil {
+		p.Stop()
 	}
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.pool == nil {
+	p := h.Pool()
+	if p == nil {
 		failures.HandleBadGateway(w, r)
 		return
 	}
-	hl := h.pool.Healthy() // should return a fanout list
+	hl := p.LiveTargets() // should return a fanout list
 	l := len(hl)
 	if l == 0 {
 		failures.HandleBadGateway(w, r)
@@ -111,7 +104,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// just proxy 1:1 if no folds in the fan
 	if l == 1 {
-		hl[0].ServeHTTP(w, r)
+		hl[0].Handler().ServeHTTP(w, r)
 		return
 	}
 	// otherwise iterate the fanout
@@ -149,6 +142,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		eg.Go(func() error {
+			// recover so a single bad upstream doesn't crash the proxy; clear
+			// the slot so the fallback path doesn't serve a partial capture
+			defer mech.RecoverFanoutPanic("fr", i, func() { captures[i] = nil })
 			r2, err := request.CloneWithoutResources(r)
 			if err != nil {
 				return err
@@ -157,7 +153,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			r2 = request.SetResources(r2, &request.Resources{Cancelable: true})
 			crw := capture.NewCaptureResponseWriter()
 			captures[i] = crw
-			hl[i].ServeHTTP(crw, r2)
+			hl[i].Handler().ServeHTTP(crw, r2)
 			statusCode := crw.StatusCode()
 			custom := h.fgr && len(h.fgrCodes) > 0
 			isGood := custom && h.fgrCodes.Contains(statusCode)
@@ -176,14 +172,44 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		eg.Wait()
 		// if claimed is still -1, the fallback case must be used
-		if atomic.CompareAndSwapInt64(&claimed, -1, -2) && r.Context().Err() == nil {
-			// this iterates the captures and serves the first non-nil response
-			for _, crw := range captures {
-				if crw != nil {
-					serve(crw)
-					break
-				}
+		if !atomic.CompareAndSwapInt64(&claimed, -1, -2) {
+			return
+		}
+		if r.Context().Err() != nil {
+			return
+		}
+		if h.fgr {
+			// FGR: no member qualified under fgrCodes; emit 502 rather
+			// than serving a disqualified response.
+			wmu.Lock()
+			defer wmu.Unlock()
+			if returned {
+				return
 			}
+			failures.HandleBadGateway(w, r)
+			select {
+			case responseWritten <- struct{}{}:
+			default:
+			}
+			return
+		}
+		// FR: serve the first non-nil response regardless of status.
+		for _, crw := range captures {
+			if crw != nil {
+				serve(crw)
+				return
+			}
+		}
+		// no member produced any response; emit 502 directly
+		wmu.Lock()
+		defer wmu.Unlock()
+		if returned {
+			return
+		}
+		failures.HandleBadGateway(w, r)
+		select {
+		case responseWritten <- struct{}{}:
+		default:
 		}
 	}()
 
