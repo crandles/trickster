@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/mech"
+	"github.com/trickstercache/trickster/v2/pkg/backends/alb/mech/fanout"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/mech/types"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/names"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/options"
@@ -45,9 +46,10 @@ const (
 
 type handler struct {
 	mech.PoolHolder
-	fgr      bool
-	fgrCodes sets.Set[int]
-	options  options.FirstGoodResponseOptions
+	fgr             bool
+	fgrCodes        sets.Set[int]
+	options         options.FirstGoodResponseOptions
+	maxCaptureBytes int
 }
 
 func RegistryEntry() types.RegistryEntry {
@@ -60,14 +62,19 @@ func RegistryEntryFGR() types.RegistryEntry {
 
 func NewFGR(o *options.Options, _ rt.Lookup) (types.Mechanism, error) {
 	return &handler{
-		fgr:      true,
-		fgrCodes: o.FgrCodesLookup,
-		options:  o.FGROptions,
+		fgr:             true,
+		fgrCodes:        o.FgrCodesLookup,
+		options:         o.FGROptions,
+		maxCaptureBytes: o.MaxCaptureBytes,
 	}, nil
 }
 
-func New(_ *options.Options, _ rt.Lookup) (types.Mechanism, error) {
-	return &handler{}, nil
+func New(o *options.Options, _ rt.Lookup) (types.Mechanism, error) {
+	h := &handler{}
+	if o != nil {
+		h.maxCaptureBytes = o.MaxCaptureBytes
+	}
+	return h, nil
 }
 
 func (h *handler) ID() types.ID {
@@ -107,6 +114,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		hl[0].Handler().ServeHTTP(w, r)
 		return
 	}
+	r, err := fanout.PrimeBody(r)
+	if err != nil {
+		failures.HandleBadGateway(w, r)
+		return
+	}
 	// otherwise iterate the fanout
 	var claimed int64 = -1
 	captures := make([]*capture.CaptureResponseWriter, l)
@@ -144,14 +156,15 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		eg.Go(func() error {
 			// recover so a single bad upstream doesn't crash the proxy; clear
 			// the slot so the fallback path doesn't serve a partial capture
-			defer mech.RecoverFanoutPanic("fr", i, func() { captures[i] = nil })
-			r2, err := request.CloneWithoutResources(r)
+			defer mech.RecoverFanoutPanic("fr", "", i, func() { captures[i] = nil })
+			r2, crw, err := fanout.PrepareClone(ctx, r, i, fanout.Config{
+				Mechanism:       "fr",
+				MaxCaptureBytes: h.maxCaptureBytes,
+				Resources:       func(int) *request.Resources { return &request.Resources{Cancelable: true} },
+			})
 			if err != nil {
 				return err
 			}
-			r2 = r2.WithContext(ctx)
-			r2 = request.SetResources(r2, &request.Resources{Cancelable: true})
-			crw := capture.NewCaptureResponseWriter()
 			captures[i] = crw
 			hl[i].Handler().ServeHTTP(crw, r2)
 			statusCode := crw.StatusCode()

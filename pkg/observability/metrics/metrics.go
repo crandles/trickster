@@ -32,6 +32,7 @@ const (
 	configSubsystem   = "config"
 	buildSubsystem    = "build"
 	frontendSubsystem = "frontend"
+	albSubsystem      = "alb"
 )
 
 // Default histogram buckets used by trickster
@@ -317,6 +318,22 @@ var (
 			Help:      "Trickster total number of failed connections.",
 		},
 	)
+
+	// ALBFanoutFailures counts per-shard failures during ALB fanout. The
+	// reason label distinguishes silent contribution failures (e.g. bad
+	// encoding, parse errors), explicit panics in the per-shard goroutine,
+	// and capture-buffer truncation. The variant label distinguishes
+	// sub-fanouts within a mechanism (e.g. TSM's paired avg-sum / avg-count
+	// queries); empty when the mechanism has only one fanout path.
+	ALBFanoutFailures = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: albSubsystem,
+			Name:      "fanout_failures_total",
+			Help:      "Count of per-shard failures during ALB fanout, by mechanism, variant, and reason.",
+		},
+		[]string{"mechanism", "variant", "reason"},
+	)
 )
 
 func init() {
@@ -333,6 +350,7 @@ func init() {
 	prometheus.MustRegister(ProxyConnectionAccepted)
 	prometheus.MustRegister(ProxyConnectionClosed)
 	prometheus.MustRegister(ProxyConnectionFailed)
+	prometheus.MustRegister(ALBFanoutFailures)
 	prometheus.MustRegister(CacheObjectOperations)
 	prometheus.MustRegister(CacheByteOperations)
 	prometheus.MustRegister(CacheEvents)
