@@ -22,7 +22,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/trickstercache/trickster/v2/pkg/backends/healthcheck"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/headers"
 	"github.com/trickstercache/trickster/v2/pkg/testutil/albpool"
 )
@@ -41,15 +40,14 @@ func TestNLMPanicMemberDoesNotCrashRequest(t *testing.T) {
 		panic("simulated upstream nil deref")
 	})
 
-	p, _, st := albpool.New(-1, []http.Handler{panicker, healthy})
-	st[0].Set(healthcheck.StatusPassing)
-	st[1].Set(healthcheck.StatusPassing)
-	time.Sleep(250 * time.Millisecond)
+	p, _, _ := albpool.NewHealthy([]http.Handler{panicker, healthy})
+	defer p.Stop()
+	albpool.WaitHealthy(t, p, 2)
 
 	h := &handler{}
 	h.SetPool(p)
 	w := httptest.NewRecorder()
-	r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
+	r := albpool.NewParentGET(t)
 
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -84,15 +82,14 @@ func TestNLMPanicAllMembersDoesNotCrashRequest(t *testing.T) {
 		panic("simulated upstream nil deref")
 	})
 
-	p, _, st := albpool.New(-1, []http.Handler{panicker, panicker})
-	st[0].Set(healthcheck.StatusPassing)
-	st[1].Set(healthcheck.StatusPassing)
-	time.Sleep(250 * time.Millisecond)
+	p, _, _ := albpool.NewHealthy([]http.Handler{panicker, panicker})
+	defer p.Stop()
+	albpool.WaitHealthy(t, p, 2)
 
 	h := &handler{}
 	h.SetPool(p)
 	w := httptest.NewRecorder()
-	r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
+	r := albpool.NewParentGET(t)
 
 	defer func() {
 		if rec := recover(); rec != nil {

@@ -20,9 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
-	"github.com/trickstercache/trickster/v2/pkg/backends/healthcheck"
 	"github.com/trickstercache/trickster/v2/pkg/observability/logging"
 	"github.com/trickstercache/trickster/v2/pkg/observability/logging/logger"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/request"
@@ -35,7 +33,7 @@ var testLogger = logging.NoopLogger()
 func TestHandleResponseMergeNilPool(t *testing.T) {
 	h := &handler{}
 	w := httptest.NewRecorder()
-	r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
+	r := albpool.NewParentGET(t)
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusBadGateway {
 		t.Errorf("expected %d got %d", http.StatusBadGateway, w.Code)
@@ -44,12 +42,13 @@ func TestHandleResponseMergeNilPool(t *testing.T) {
 
 func TestHandleResponseMerge(t *testing.T) {
 	logger.SetLogger(testLogger)
-	r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
+	r := albpool.NewParentGET(t)
 	rsc := request.NewResources(nil, nil, nil, nil, nil, nil)
 	rsc.IsMergeMember = true
 	r = request.SetResources(r, rsc)
 
 	p, _, _ := albpool.New(0, nil)
+	defer p.Stop()
 	h := &handler{mergePaths: []string{"/"}}
 	h.SetPool(p)
 	w := httptest.NewRecorder()
@@ -58,12 +57,11 @@ func TestHandleResponseMerge(t *testing.T) {
 		t.Error("expected 502 got", w.Code)
 	}
 
-	var st []*healthcheck.Status
-	p, _, st = albpool.New(-1,
+	p, _, _ = albpool.NewHealthy(
 		[]http.Handler{http.HandlerFunc(tu.BasicHTTPHandler)})
+	defer p.Stop()
 	h.SetPool(p)
-	st[0].Set(0)
-	time.Sleep(250 * time.Millisecond)
+	albpool.WaitHealthy(t, p, 1)
 
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, r)
@@ -71,15 +69,14 @@ func TestHandleResponseMerge(t *testing.T) {
 		t.Error("expected 200 got", w.Code)
 	}
 
-	p, _, st = albpool.New(-1,
+	p, _, _ = albpool.NewHealthy(
 		[]http.Handler{
 			http.HandlerFunc(tu.BasicHTTPHandler),
 			http.HandlerFunc(tu.BasicHTTPHandler),
 		})
+	defer p.Stop()
 	h.SetPool(p)
-	st[0].Set(0)
-	st[1].Set(0)
-	time.Sleep(250 * time.Millisecond)
+	albpool.WaitHealthy(t, p, 2)
 
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, r)

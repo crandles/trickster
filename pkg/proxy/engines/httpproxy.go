@@ -103,17 +103,19 @@ func DoProxy(w io.Writer, r *http.Request, closeResponse bool) *http.Response {
 				// Blocks until server completes
 				grClose := reader != nil && closeResponse
 				closeResponse = false
-				go func() {
+				goWithRecover("doproxy.pcf.copy", func() {
+					defer func() {
+						if grClose {
+							reader.Close()
+						}
+					}()
+					defer reqs.Delete(key)
+					defer pcf.Close()
 					if _, err := io.Copy(pcf, reader); err != nil {
 						logger.Error("pcf upstream copy failed",
 							logging.Pairs{"error": err.Error()})
 					}
-					pcf.Close()
-					reqs.Delete(key)
-					if grClose {
-						reader.Close()
-					}
-				}()
+				})
 				if err := pcf.AddClient(writer); err != nil {
 					return nil
 				}

@@ -39,6 +39,7 @@ func TestFRPanicMemberDoesNotCrashRequest(t *testing.T) {
 	})
 
 	p, _, st := albpool.New(-1, []http.Handler{healthy, panicker})
+	defer p.Stop()
 	st[0].Set(healthcheck.StatusPassing)
 	st[1].Set(healthcheck.StatusPassing)
 	time.Sleep(250 * time.Millisecond)
@@ -86,6 +87,7 @@ func TestFRPanicAllMembersDoesNotCrashRequest(t *testing.T) {
 	})
 
 	p, _, st := albpool.New(-1, []http.Handler{panicker, panicker})
+	defer p.Stop()
 	st[0].Set(healthcheck.StatusPassing)
 	st[1].Set(healthcheck.StatusPassing)
 	time.Sleep(250 * time.Millisecond)

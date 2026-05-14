@@ -311,7 +311,7 @@ func DeltaProxyCacheRequest(w http.ResponseWriter, r *http.Request, modeler *tim
 				if err != nil {
 					logger.Error("cache object unmarshaling failed",
 						logging.Pairs{"key": key, "backendName": client.Name(), "detail": err.Error()})
-					go cache.Remove(key)
+					goWithRecover("dpc.cache.Remove.unmarshal", func() { cache.Remove(key) })
 					cts, doc, elapsed, err = fetchTimeseries(pr, trq, client, modeler)
 					if err != nil {
 						return buildErrorResult(doc.StatusCode, doc.SafeHeaderClone(), doc.Body), nil
@@ -540,7 +540,7 @@ func DeltaProxyCacheRequest(w http.ResponseWriter, r *http.Request, modeler *tim
 		span.AddEvent("Not Caching")
 	}
 	cacheStatus = status.LookupStatusPurge
-	go cache.Remove(key)
+	goWithRecover("dpc.cache.Remove.purge", func() { cache.Remove(key) })
 	var cts timeseries.Timeseries
 	cts, doc, elapsed, err = fetchTimeseries(pr, trq, client, modeler)
 	if err != nil {
@@ -608,8 +608,10 @@ func fetchTimeseries(pr *proxyRequest, trq *timeseries.TimeRangeQuery,
 		elapsed = time.Since(start)
 	}
 
-	go logUpstreamRequest(o.Name, o.Provider, handlerName,
-		pr.Method, pr.URL.String(), pr.UserAgent(), resp.StatusCode, 0, elapsed.Seconds())
+	goWithRecover("dpc.logUpstreamRequest", func() {
+		logUpstreamRequest(o.Name, o.Provider, handlerName,
+			pr.Method, pr.URL.String(), pr.UserAgent(), resp.StatusCode, 0, elapsed.Seconds())
+	})
 
 	d := &HTTPDocument{
 		Status:     resp.Status,

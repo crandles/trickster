@@ -37,8 +37,7 @@ import (
 
 func TestALBCache(t *testing.T) {
 	t.Run("C1 shared cache_key_prefix collides across pool members", func(t *testing.T) {
-		const respTmpl = `{"status":"success","data":{"resultType":"vector","result":[` +
-			`{"metric":{"__name__":"up","job":"%s"},"value":[1700000000,"%s"]}]}}`
+		respTmpl := albTestdata(t, "alb_cache/c1_vector.json.tmpl")
 
 		var aHits, bHits atomic.Int64
 		mk := func(label, val string, hits *atomic.Int64) *httptest.Server {
@@ -64,51 +63,8 @@ func TestALBCache(t *testing.T) {
 		metricsPort := 18901
 		mgmtPort := 18902
 
-		yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-backends:
-  prom-A:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    cache_key_prefix: shared
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-B:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    cache_key_prefix: shared
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-shared-cache:
-    provider: alb
-    alb:
-      mechanism: rr
-      pool:
-        - prom-A
-        - prom-B
-`, frontPort, metricsPort, mgmtPort, upstreamA.URL, upstreamB.URL)
+		yaml := fmt.Sprintf(albTestdata(t, "alb_cache/c1.yaml.tmpl"),
+			frontPort, metricsPort, mgmtPort, upstreamA.URL, upstreamB.URL)
 
 		cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 		require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
@@ -182,9 +138,7 @@ backends:
 	})
 
 	t.Run("C2 tsm tolerates one member with unsupported content-encoding", func(t *testing.T) {
-		const promRange = `{"status":"success","data":{"resultType":"matrix","result":[` +
-			`{"metric":{"__name__":"up","job":"prometheus"},"values":[%s]}` +
-			`]}}`
+		promRange := albTestdata(t, "alb_cache/c2_prom_range.json.tmpl")
 
 		mkRange := func(start, end, step int64) string {
 			var b strings.Builder
@@ -246,62 +200,8 @@ backends:
 		metricsPort := 18911
 		mgmtPort := 18912
 
-		yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-backends:
-  prom-0:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-1:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-2:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-tsm-encoding:
-    provider: alb
-    alb:
-      mechanism: tsm
-      output_format: prometheus
-      pool:
-        - prom-0
-        - prom-1
-        - prom-2
-`, frontPort, metricsPort, mgmtPort, m0.URL, m1.URL, m2.URL)
+		yaml := fmt.Sprintf(albTestdata(t, "alb_cache/c2.yaml.tmpl"),
+			frontPort, metricsPort, mgmtPort, m0.URL, m1.URL, m2.URL)
 
 		cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 		require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
@@ -378,6 +278,7 @@ backends:
 	})
 
 	t.Run("V3 tsm phit marker for mixed cache hit/miss across members", func(t *testing.T) {
+		matrixTmpl := albTestdata(t, "alb_cache/v3_matrix.json.tmpl")
 		var m1Hits, m2Hits atomic.Int64
 		mk := func(hits *atomic.Int64) *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -405,10 +306,7 @@ backends:
 					fmt.Fprintf(&b, `[%d,"1"]`, ts)
 				}
 				w.WriteHeader(http.StatusOK)
-				fmt.Fprintf(w,
-					`{"status":"success","data":{"resultType":"matrix","result":[`+
-						`{"metric":{"__name__":"up","job":"prometheus"},"values":[%s]}]}}`,
-					b.String())
+				fmt.Fprintf(w, matrixTmpl, b.String())
 			}))
 		}
 		up1 := mk(&m1Hits)
@@ -420,52 +318,8 @@ backends:
 		metricsPort := 18921
 		mgmtPort := 18922
 
-		yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-  mem2:
-    provider: memory
-backends:
-  prom-c1:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-c2:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem2
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-tsm-mixed-cache:
-    provider: alb
-    alb:
-      mechanism: tsm
-      output_format: prometheus
-      pool:
-        - prom-c1
-        - prom-c2
-`, frontPort, metricsPort, mgmtPort, up1.URL, up2.URL)
+		yaml := fmt.Sprintf(albTestdata(t, "alb_cache/v3.yaml.tmpl"),
+			frontPort, metricsPort, mgmtPort, up1.URL, up2.URL)
 
 		cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 		require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))

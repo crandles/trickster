@@ -183,8 +183,10 @@ func (pr *proxyRequest) Fetch() ([]byte, *http.Response, time.Duration, error) {
 
 	elapsed := time.Since(start) // includes any time required to decompress the document for deserialization
 
-	go logUpstreamRequest(o.Name, o.Provider, handlerName, pr.upstreamRequest.Method,
-		pr.upstreamRequest.URL.String(), pr.UserAgent(), resp.StatusCode, len(body), elapsed.Seconds())
+	goWithRecover("proxyRequest.Fetch.logUpstreamRequest", func() {
+		logUpstreamRequest(o.Name, o.Provider, handlerName, pr.upstreamRequest.Method,
+			pr.upstreamRequest.URL.String(), pr.UserAgent(), resp.StatusCode, len(body), elapsed.Seconds())
+	})
 
 	return body, resp, elapsed, nil
 }
@@ -316,7 +318,15 @@ func (pr *proxyRequest) makeUpstreamRequests() error {
 				pr.revalidationRequest = req.WithContext(trace.ContextWithSpan(req.Context(), span))
 				defer span.End()
 			}
-			pr.revalidationReader, pr.revalidationResponse, _ = PrepareFetchReader(pr.revalidationRequest)
+			var contentLength int64
+			pr.revalidationReader, pr.revalidationResponse, contentLength = PrepareFetchReader(pr.revalidationRequest)
+			if pr.revalidationReader == nil {
+				logger.Error("revalidation upstream returned no reader",
+					logging.Pairs{
+						"url":           pr.revalidationRequest.URL.String(),
+						"contentLength": contentLength,
+					})
+			}
 		})
 	}
 
@@ -331,7 +341,15 @@ func (pr *proxyRequest) makeUpstreamRequests() error {
 				if span != nil {
 					defer span.End()
 				}
-				pr.originReaders[i], pr.originResponses[i], _ = PrepareFetchReader(req)
+				var contentLength int64
+				pr.originReaders[i], pr.originResponses[i], contentLength = PrepareFetchReader(req)
+				if pr.originReaders[i] == nil {
+					logger.Error("origin upstream returned no reader",
+						logging.Pairs{
+							"url":           req.URL.String(),
+							"contentLength": contentLength,
+						})
+				}
 			})
 		}
 	}

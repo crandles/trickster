@@ -58,7 +58,9 @@ func TestDoProxy(t *testing.T) {
 		ResponseBodyBytes: []byte(testResponseBody),
 	}
 
-	o.HTTPClient = http.DefaultClient
+	tr := &http.Transport{}
+	o.HTTPClient = &http.Client{Transport: tr}
+	t.Cleanup(tr.CloseIdleConnections)
 	br := bytes.NewBuffer([]byte(testResponseBody))
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", es.URL, br)
@@ -109,7 +111,9 @@ func TestProxyRequestBadGateway(t *testing.T) {
 		ResponseHeaders: map[string]string{},
 	}
 
-	o.HTTPClient = http.DefaultClient
+	tr := &http.Transport{}
+	o.HTTPClient = &http.Client{Transport: tr}
+	t.Cleanup(tr.CloseIdleConnections)
 	br := bytes.NewBuffer([]byte(testResponseBody))
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", badUpstream, br)
@@ -136,6 +140,7 @@ func TestClockOffsetWarning(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}
 	s := httptest.NewServer(http.HandlerFunc(handler))
+	defer s.Close()
 
 	conf, err := config.Load([]string{
 		"-origin-url",
@@ -152,7 +157,9 @@ func TestClockOffsetWarning(t *testing.T) {
 	}
 
 	o.Name = "default"
-	o.HTTPClient = http.DefaultClient
+	tr := &http.Transport{}
+	o.HTTPClient = &http.Client{Transport: tr}
+	t.Cleanup(tr.CloseIdleConnections)
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", s.URL, nil)
 	r = r.WithContext(tc.WithResources(r.Context(),
@@ -196,7 +203,9 @@ func TestDoProxyWithPCF(t *testing.T) {
 		CollapsedForwardingType: forwarding.CFTypeProgressive,
 	}
 
-	o.HTTPClient = http.DefaultClient
+	tr := &http.Transport{}
+	o.HTTPClient = &http.Client{Transport: tr}
+	t.Cleanup(tr.CloseIdleConnections)
 	br := bytes.NewBuffer([]byte(testResponseBody))
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", es.URL, br)
@@ -252,7 +261,9 @@ func TestProxyRequestWithPCFMultipleClients(t *testing.T) {
 		CollapsedForwardingType: forwarding.CFTypeProgressive,
 	}
 
-	o.HTTPClient = http.DefaultClient
+	tr := &http.Transport{}
+	o.HTTPClient = &http.Client{Transport: tr}
+	t.Cleanup(tr.CloseIdleConnections)
 	br := bytes.NewBuffer([]byte(testResponseBody))
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", es.URL, br)
@@ -399,7 +410,9 @@ func TestPrepareFetchReaderErr(t *testing.T) {
 	}
 
 	o := conf.Backends["default"]
-	o.HTTPClient = http.DefaultClient
+	tr := &http.Transport{}
+	o.HTTPClient = &http.Client{Transport: tr}
+	t.Cleanup(tr.CloseIdleConnections)
 
 	r := httptest.NewRequest("GET", "http://example.com/", nil)
 	r = r.WithContext(tc.WithResources(r.Context(),

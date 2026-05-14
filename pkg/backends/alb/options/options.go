@@ -52,6 +52,11 @@ type Options struct {
 	// runaway upstreams faster). When 0, falls back to the parent Backend's
 	// max_capture_bytes, then to the package-level default (256 MiB).
 	MaxCaptureBytes int `yaml:"max_capture_bytes,omitempty"`
+	// MaxFanoutCaptureBytes, if > 0, caps the aggregate in-flight
+	// capture-buffer reservations across all slots in one ALB fanout call.
+	// When 0, falls back to the parent Backend's max_fanout_capture_bytes,
+	// which itself defaults to 0 (no aggregate cap).
+	MaxFanoutCaptureBytes int `yaml:"max_fanout_capture_bytes,omitempty"`
 	// OutputFormat accompanies the tsmerge Mechanism to indicate the provider output format
 	// options include any valid time seres backend like prometheus, influxdb or clickhouse
 	OutputFormat string `yaml:"output_format,omitempty"`
@@ -80,6 +85,13 @@ type FirstGoodResponseOptions struct {
 
 type TimeSeriesMergeOptions struct {
 	ConcurrencyOptions ConcurrencyOptions `yaml:",inline"`
+	// DedupToleranceMs is an opt-in tolerance window (milliseconds) for
+	// clustering near-duplicate samples produced by independent fan-out
+	// shards. When two shards sample the same metric at timestamps that
+	// differ by <= this many milliseconds, the cluster collapses to a single
+	// survivor (first-seen-after-sort wins). Nil or 0 preserves the legacy
+	// exact-epoch dedup behavior.
+	DedupToleranceMs *int `yaml:"dedup_tolerance_ms,omitempty"`
 }
 
 type NewestLastModifiedOptions struct {
@@ -210,6 +222,59 @@ func (o *Options) ValidatePool(backendName string, allBackends sets.Set[string])
 	for _, bn := range o.Pool {
 		if _, ok := allBackends[bn]; !ok {
 			return te.NewErrInvalidPoolMemberName(backendName, bn)
+		}
+	}
+	return nil
+}
+
+// ValidateNoCycles walks the ALB pool reference graph and returns an error if
+// any ALB pool transitively references itself. The input maps ALB-backend
+// name to its Options; non-ALB pool members are leaves and ignored. A back
+// edge to a node currently on the DFS stack is reported as a cycle.
+//
+// Without this check, mutual references (A targets B targets A) load cleanly
+// and pass health-probe aggregation, but the first real request recurses
+// forever, OOMs the stack, or stalls until the request context expires.
+func ValidateNoCycles(albs map[string]*Options) error {
+	const (
+		unseen   = 0
+		visiting = 1
+		done     = 2
+	)
+	state := make(map[string]int, len(albs))
+	var visit func(name string, path []string) error
+	visit = func(name string, path []string) error {
+		switch state[name] {
+		case visiting:
+			// back edge: cycle detected; render the cycle for the operator
+			start := slices.Index(path, name)
+			cyc := append(slices.Clone(path[start:]), name)
+			return fmt.Errorf("cycle detected in alb pool references: %s",
+				strings.Join(cyc, " -> "))
+		case done:
+			return nil
+		}
+		o, ok := albs[name]
+		if !ok {
+			// not an ALB; leaf for cycle purposes
+			return nil
+		}
+		state[name] = visiting
+		path = append(path, name)
+		for _, target := range o.Pool {
+			if _, isALB := albs[target]; !isALB {
+				continue
+			}
+			if err := visit(target, path); err != nil {
+				return err
+			}
+		}
+		state[name] = done
+		return nil
+	}
+	for name := range albs {
+		if err := visit(name, nil); err != nil {
+			return err
 		}
 	}
 	return nil

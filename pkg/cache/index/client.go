@@ -19,6 +19,7 @@ package index
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -91,6 +92,7 @@ func NewIndexedClient(
 			}
 		}
 		if o.FlushInterval > 0 {
+			idx.wg.Add(1)
 			go idx.flusher(ctx)
 		} else if options.NeedsFlushInterval {
 			logger.Warn("cache index flusher was not started, recommended for provider",
@@ -99,6 +101,7 @@ func NewIndexedClient(
 	}
 
 	if o.ReapInterval > 0 {
+		idx.wg.Add(1)
 		go idx.reaper(ctx)
 	} else if options.NeedsReapInterval {
 		logger.Warn("cache reaper was not started, recommended for provider",
@@ -132,6 +135,7 @@ type IndexedClient struct {
 	lastWrite     atomicx.Time         `msg:"-"`
 	isClosing     atomic.Bool
 	cancel        context.CancelFunc
+	wg            sync.WaitGroup
 	flusherExited atomic.Bool
 	reaperExited  atomic.Bool
 
@@ -299,6 +303,7 @@ func (idx *IndexedClient) Remove(cacheKeys ...string) error {
 func (idx *IndexedClient) Close() error {
 	idx.cancel() // stop the reaper & flusher
 	idx.isClosing.Store(true)
+	idx.wg.Wait() // wait for flusher/reaper goroutines to exit
 	if idx.ico.NeedsFlushInterval {
 		idx.flushOnce()
 	}
@@ -308,6 +313,7 @@ func (idx *IndexedClient) Close() error {
 
 // flusher periodically calls the cache's index flush func that writes the cache index to disk
 func (idx *IndexedClient) flusher(ctx context.Context) {
+	defer idx.wg.Done()
 FLUSHER:
 	for {
 		fi := idx.options.Load().(*options.Options).FlushInterval
@@ -360,6 +366,7 @@ func (idx *IndexedClient) flushOnce() {
 
 // reaper continually iterates through the cache to find expired elements and removes them
 func (idx *IndexedClient) reaper(ctx context.Context) {
+	defer idx.wg.Done()
 REAPER:
 	for {
 		ri := idx.options.Load().(*options.Options).ReapInterval

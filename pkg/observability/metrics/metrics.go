@@ -33,6 +33,7 @@ const (
 	buildSubsystem    = "build"
 	frontendSubsystem = "frontend"
 	albSubsystem      = "alb"
+	healthSubsystem   = "healthcheck"
 )
 
 // Default histogram buckets used by trickster
@@ -322,9 +323,11 @@ var (
 	// ALBFanoutFailures counts per-shard failures during ALB fanout. The
 	// reason label distinguishes silent contribution failures (e.g. bad
 	// encoding, parse errors), explicit panics in the per-shard goroutine,
-	// and capture-buffer truncation. The variant label distinguishes
-	// sub-fanouts within a mechanism (e.g. TSM's paired avg-sum / avg-count
-	// queries); empty when the mechanism has only one fanout path.
+	// capture-buffer truncation, and routing flap (target was healthy at
+	// snapshot time but failing by the time the response was observed).
+	// The variant label distinguishes sub-fanouts within a mechanism
+	// (e.g. TSM's paired avg-sum / avg-count queries); empty when the
+	// mechanism has only one fanout path.
 	ALBFanoutFailures = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: metricNamespace,
@@ -333,6 +336,65 @@ var (
 			Help:      "Count of per-shard failures during ALB fanout, by mechanism, variant, and reason.",
 		},
 		[]string{"mechanism", "variant", "reason"},
+	)
+
+	// ALBFanoutAttempts counts ALB fanout calls (one increment per All/Race
+	// invocation, not per shard). Paired with ALBFanoutFailures so dashboards
+	// can compute a failure rate as failures_total / attempts_total. The
+	// variant label distinguishes sub-fanouts within a mechanism (e.g. TSM's
+	// paired avg-sum / avg-count queries); empty when the mechanism has only
+	// one fanout path.
+	ALBFanoutAttempts = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: albSubsystem,
+			Name:      "fanout_attempts_total",
+			Help:      "Count of ALB fanout invocations, by mechanism and variant.",
+		},
+		[]string{"mechanism", "variant"},
+	)
+
+	// ALBPoolRefreshPanicRecovered counts recovered panics in ALB pool refresh
+	// worker goroutines (checkHealth, listenStatusUpdates). A dead worker leaves
+	// the healthy-target snapshot stale; the per-call re-filter in Targets()
+	// still produces correct dispatch, but operator-visible gauges drift.
+	ALBPoolRefreshPanicRecovered = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: albSubsystem,
+			Name:      "pool_refresh_panic_recovered_total",
+			Help:      "Count of recovered panics in ALB pool refresh worker goroutines, by worker.",
+		},
+		[]string{"worker"},
+	)
+
+	// HealthcheckProbePanicRecovered counts recovered panics in the per-target
+	// health-probe ticker goroutine. Without recovery, a single panicking probe
+	// would kill the loop and freeze the target's Status at its last value,
+	// silently masking real upstream failures from operators and ALB pools.
+	HealthcheckProbePanicRecovered = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: healthSubsystem,
+			Name:      "probe_panic_recovered_total",
+			Help:      "Count of recovered panics in the per-target health-probe ticker, by target.",
+		},
+		[]string{"target"},
+	)
+
+	// ProxyEnginesPanicRecovered counts recovered panics in fire-and-forget
+	// goroutines spawned by the proxy/engines layer (DPC cache.Remove, upstream
+	// access-log emission, PCF io.Copy pumps). A panic in any of these would
+	// otherwise crash the entire trickster process, since the goroutine has no
+	// recover above it. The site label identifies which call site recovered.
+	ProxyEnginesPanicRecovered = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: proxySubsystem,
+			Name:      "engines_panic_recovered_total",
+			Help:      "Count of recovered panics in proxy/engines fire-and-forget goroutines, by call site.",
+		},
+		[]string{"site"},
 	)
 )
 
@@ -351,6 +413,10 @@ func init() {
 	prometheus.MustRegister(ProxyConnectionClosed)
 	prometheus.MustRegister(ProxyConnectionFailed)
 	prometheus.MustRegister(ALBFanoutFailures)
+	prometheus.MustRegister(ALBFanoutAttempts)
+	prometheus.MustRegister(ALBPoolRefreshPanicRecovered)
+	prometheus.MustRegister(HealthcheckProbePanicRecovered)
+	prometheus.MustRegister(ProxyEnginesPanicRecovered)
 	prometheus.MustRegister(CacheObjectOperations)
 	prometheus.MustRegister(CacheByteOperations)
 	prometheus.MustRegister(CacheEvents)

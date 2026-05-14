@@ -22,7 +22,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/trickstercache/trickster/v2/pkg/backends/healthcheck"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/request"
 	tu "github.com/trickstercache/trickster/v2/pkg/testutil"
 	"github.com/trickstercache/trickster/v2/pkg/testutil/albpool"
@@ -36,17 +35,16 @@ func TestTSMPanicMemberDoesNotCrashRequest(t *testing.T) {
 		panic("simulated upstream nil deref")
 	})
 
-	p, _, st := albpool.New(-1, []http.Handler{
+	p, _, _ := albpool.NewHealthy([]http.Handler{
 		http.HandlerFunc(tu.BasicHTTPHandler),
 		panicker,
 	})
-	st[0].Set(healthcheck.StatusPassing)
-	st[1].Set(healthcheck.StatusPassing)
-	time.Sleep(250 * time.Millisecond)
+	defer p.Stop()
+	albpool.WaitHealthy(t, p, 2)
 
 	rsc := request.NewResources(nil, nil, nil, nil, nil, nil)
 	rsc.IsMergeMember = true
-	r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
+	r := albpool.NewParentGET(t)
 	r = request.SetResources(r, rsc)
 
 	h := &handler{mergePaths: []string{"/"}}
@@ -82,14 +80,13 @@ func TestTSMPanicAllMembersDoesNotCrashRequest(t *testing.T) {
 		panic("simulated upstream nil deref")
 	})
 
-	p, _, st := albpool.New(-1, []http.Handler{panicker, panicker})
-	st[0].Set(healthcheck.StatusPassing)
-	st[1].Set(healthcheck.StatusPassing)
-	time.Sleep(250 * time.Millisecond)
+	p, _, _ := albpool.NewHealthy([]http.Handler{panicker, panicker})
+	defer p.Stop()
+	albpool.WaitHealthy(t, p, 2)
 
 	rsc := request.NewResources(nil, nil, nil, nil, nil, nil)
 	rsc.IsMergeMember = true
-	r, _ := http.NewRequest("GET", "http://trickstercache.org/", nil)
+	r := albpool.NewParentGET(t)
 	r = request.SetResources(r, rsc)
 
 	h := &handler{mergePaths: []string{"/"}}

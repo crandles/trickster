@@ -50,6 +50,7 @@ func TestNLMPostBodyFanoutIsRaceFree(t *testing.T) {
 	}
 
 	p, _, st := albpool.New(-1, []http.Handler{mk("a"), mk("b"), mk("c"), mk("d")})
+	defer p.Stop()
 	for _, s := range st {
 		s.Set(healthcheck.StatusPassing)
 	}

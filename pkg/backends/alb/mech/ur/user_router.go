@@ -24,17 +24,13 @@ import (
 	uropt "github.com/trickstercache/trickster/v2/pkg/backends/alb/mech/ur/options"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/names"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/options"
-	"github.com/trickstercache/trickster/v2/pkg/backends/alb/pool"
 	rt "github.com/trickstercache/trickster/v2/pkg/backends/providers/registry/types"
 	"github.com/trickstercache/trickster/v2/pkg/errors"
 	at "github.com/trickstercache/trickster/v2/pkg/proxy/authenticator/types"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/request"
 )
 
-const (
-	URID   types.ID   = 5
-	URName types.Name = "user_router"
-)
+const URName types.Name = "user_router"
 
 type Handler struct {
 	// mu guards options, authenticator, enableReplaceCreds against concurrent
@@ -48,8 +44,9 @@ type Handler struct {
 
 func RegistryEntry() types.RegistryEntry {
 	return types.RegistryEntry{
-		ID: URID, Name: URName,
-		ShortName: names.MechanismUR, New: New,
+		Name:      URName,
+		ShortName: names.MechanismUR,
+		New:       New,
 	}
 }
 
@@ -59,10 +56,6 @@ func New(o *options.Options, _ rt.Lookup) (types.Mechanism, error) {
 	}
 	out := &Handler{options: o.UserRouter}
 	return out, nil
-}
-
-func (h *Handler) ID() types.ID {
-	return URID
 }
 
 func (h *Handler) Name() types.Name {
@@ -168,8 +161,3 @@ func (h *Handler) handleDefault(w http.ResponseWriter, r *http.Request) {
 	}
 	dh.ServeHTTP(w, r)
 }
-
-// stubs for unused interface functions
-func (h *Handler) SetPool(_ pool.Pool) {}
-func (h *Handler) StopPool()           {}
-func (h *Handler) Pool() pool.Pool     { return nil }

@@ -42,9 +42,7 @@ import (
 //   - alb-inner appears in alb-outer's availablePoolMembers (not unchecked)
 //   - traffic through alb-outer reaches alb-inner's leaf members
 func TestALBNestedPoolAvailable(t *testing.T) {
-	const promRange = `{"status":"success","data":{"resultType":"matrix","result":[` +
-		`{"metric":{"__name__":"up","job":"prometheus"},"values":[%s]}` +
-		`]}}`
+	promRange := albTestdata(t, "alb_nested/prom_range.json.tmpl")
 	const buildInfo = `{"status":"success","data":{"version":"2.0"}}`
 
 	mkRange := func(start, end, step int64) string {
@@ -92,56 +90,8 @@ func TestALBNestedPoolAvailable(t *testing.T) {
 		mgmtPort    = 18962
 	)
 
-	yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-backends:
-  prom-a:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-b:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-inner:
-    provider: alb
-    alb:
-      mechanism: rr
-      pool:
-        - prom-a
-        - prom-b
-  alb-outer:
-    provider: alb
-    alb:
-      mechanism: tsm
-      output_format: prometheus
-      pool:
-        - alb-inner
-`, frontPort, metricsPort, mgmtPort, leafA.URL, leafB.URL)
+	yaml := fmt.Sprintf(albTestdata(t, "alb_nested/nested.yaml.tmpl"),
+		frontPort, metricsPort, mgmtPort, leafA.URL, leafB.URL)
 
 	cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))

@@ -312,17 +312,35 @@ func applyCachingConfig(si *instance.ServerInstance,
 				continue
 			}
 
-			// if we got to this point, the cache won't be used, so lets close it
-			go func() {
-				time.Sleep(newConf.MgmtConfig.ReloadDrainTimeout)
-				w.Close()
-			}()
+			// if we got to this point, the cache won't be used, so close it.
+			closeOldCache(k, w, newConf.MgmtConfig.ReloadDrainTimeout)
 		}
 
 		// the newly-named cache is not in the old config or couldn't be reused, so make it anew
 		caches[k] = registry.NewCache(k, v)
 	}
+
+	// close caches that existed in the old config but are absent from the new
+	// config; without this, renaming a cache leaks the old cache's goroutines.
+	for k, w := range si.Caches {
+		if _, ok := newConf.Caches[k]; ok {
+			continue
+		}
+		closeOldCache(k, w, newConf.MgmtConfig.ReloadDrainTimeout)
+	}
 	return caches
+}
+
+func closeOldCache(name string, w cache.Cache, drainTimeout time.Duration) {
+	if m, ok := w.(*manager.Manager); ok {
+		m.SetCloseDrainTimeout(drainTimeout)
+	}
+	go func() {
+		if err := w.Close(); err != nil {
+			logger.Warn("error closing old cache during reload",
+				logging.Pairs{"cache": name, "error": err.Error()})
+		}
+	}()
 }
 
 func initLogger(c *config.Config) logging.Logger {
