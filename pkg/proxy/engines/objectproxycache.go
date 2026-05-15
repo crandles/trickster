@@ -335,6 +335,11 @@ func handlePCF(pr *proxyRequest) error {
 		pr.determineCacheability()
 
 		goWithRecover("opc.pcf.copy", func() {
+			defer func() {
+				if reader != nil {
+					reader.Close()
+				}
+			}()
 			defer reqs.Delete(pr.key)
 			defer pcf.Close()
 			var dest io.Writer = pcf

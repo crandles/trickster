@@ -766,7 +766,7 @@ func fetchExtents(el timeseries.ExtentList, rsc *request.Resources, h http.Heade
 				var s string
 				if resp.Body != nil {
 					var readErr error
-					b, readErr = io.ReadAll(resp.Body)
+					b, readErr = io.ReadAll(io.LimitReader(resp.Body, errorBodyCap))
 					if readErr != nil {
 						logger.Warn("failed to read upstream error response body",
 							logging.Pairs{"detail": readErr.Error()})
@@ -787,7 +787,7 @@ func fetchExtents(el timeseries.ExtentList, rsc *request.Resources, h http.Heade
 						"clientRequestHeaders":    headers.SanitizeForLogging(pr.Request.Header),
 						"upstreamRequestURL":      pr.upstreamRequest.URL.String(),
 						"upstreamRequestMethod":   pr.upstreamRequest.Method,
-						"upstreamRequestHeaders":  headers.LogString(pr.upstreamRequest.Header),
+						"upstreamRequestHeaders":  headers.SanitizeForLogging(pr.upstreamRequest.Header),
 						"upstreamResponseHeaders": headers.LogString(resp.Header),
 						"upstreamResponseBody":    s,
 					},

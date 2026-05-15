@@ -30,6 +30,7 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/observability/tracing"
 	tspan "github.com/trickstercache/trickster/v2/pkg/observability/tracing/span"
 	tctx "github.com/trickstercache/trickster/v2/pkg/proxy/context"
+	tpe "github.com/trickstercache/trickster/v2/pkg/proxy/errors"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/headers"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/methods"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/ranges/byterange"
@@ -172,7 +173,18 @@ func (pr *proxyRequest) Fetch() ([]byte, *http.Response, time.Duration, error) {
 	var body []byte
 	var err error
 	if reader != nil {
-		body, err = io.ReadAll(reader)
+		if o != nil && o.MaxObjectSizeBytes > 0 {
+			// +1 so reaching limit means overflow, not exactly-at-limit.
+			limit := int64(o.MaxObjectSizeBytes) + 1
+			body, err = io.ReadAll(io.LimitReader(reader, limit))
+			if err == nil && int64(len(body)) >= limit {
+				err = tpe.ErrUnexpectedUpstreamResponse
+				logger.Error("upstream response exceeded MaxObjectSizeBytes",
+					logging.Pairs{"url": pr.URL.String(), "max": o.MaxObjectSizeBytes})
+			}
+		} else {
+			body, err = io.ReadAll(reader)
+		}
 		resp.Body.Close()
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 	}
@@ -437,11 +449,13 @@ func (pr *proxyRequest) writeResponseBody() {
 	n, err := io.Copy(pr.responseWriter, pr.upstreamReader)
 	if err != nil {
 		logger.Error("error copying upstream response body", logging.Pairs{"error": err})
-		if pr.upstreamResponse != nil && pr.upstreamResponse.ContentLength > 0 &&
-			n < pr.upstreamResponse.ContentLength {
-			if c := request.GetUpstreamShortReadCapture(pr.upstreamRequest.Context()); c != nil {
-				c.Mark()
-			}
+	}
+	// Chunked / transparent-gzip transports can return err==nil with n<CL;
+	// trigger short-read regardless of err.
+	if pr.upstreamResponse != nil && pr.upstreamResponse.ContentLength > 0 &&
+		n < pr.upstreamResponse.ContentLength {
+		if c := request.GetUpstreamShortReadCapture(pr.upstreamRequest.Context()); c != nil {
+			c.Mark()
 		}
 	}
 }

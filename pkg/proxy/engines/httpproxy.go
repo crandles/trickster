@@ -352,8 +352,16 @@ func recordResults(r *http.Request, engine string, cacheStatus status.LookupStat
 	s := cacheStatus.String()
 
 	if pc != nil && !pc.NoMetrics {
+		// Use the matched PathConfig identifier so request URL.Path can't
+		// inflate label cardinality.
+		labelPath := path
+		if pc.HandlerName != "" {
+			labelPath = pc.HandlerName
+		} else if pc.Path != "" {
+			labelPath = pc.Path
+		}
 		httpStatus := strconv.Itoa(statusCode)
-		lvs := []string{o.Name, o.Provider, r.Method, s, httpStatus, path}
+		lvs := []string{o.Name, o.Provider, r.Method, s, httpStatus, labelPath}
 		metrics.ProxyRequestStatus.WithLabelValues(lvs...).Inc()
 		if elapsed > 0 {
 			metrics.ProxyRequestDuration.WithLabelValues(lvs...).Observe(elapsed)
