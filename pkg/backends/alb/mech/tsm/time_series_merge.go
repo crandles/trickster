@@ -582,6 +582,10 @@ func (h *handler) serveStandard(
 	// member advertised for that key. Structural headers (Content-Type,
 	// Content-Length, Date, Last-Modified, Transfer-Encoding) were already
 	// removed by StripMergeHeaders.
+	if mrf == nil {
+		failures.HandleBadGateway(w, r)
+		return
+	}
 	if winnerHeaders != nil {
 		headers.Merge(w.Header(), winnerHeaders)
 	}
@@ -856,6 +860,10 @@ func (h *handler) serveWeightedAvg(
 	// See serveStandard for the rationale -- carry the winner's custom
 	// response headers through the fanout so backend-set headers like
 	// `X-Test-Origin` survive the merge. (#970)
+	if mrf == nil {
+		failures.HandleBadGateway(w, r)
+		return
+	}
 	mergeMultiValuedHeaders(w.Header(), results, winnerHeaders)
 	if winnerHeaders != nil {
 		headers.Merge(w.Header(), winnerHeaders)

@@ -80,8 +80,8 @@ func TestHandleResponseMerge(t *testing.T) {
 
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, r)
-	if w.Code != http.StatusOK {
-		t.Error("expected 200 got", w.Code)
+	if w.Code != http.StatusBadGateway {
+		t.Error("expected 502 got", w.Code)
 	}
 
 	w = httptest.NewRecorder()

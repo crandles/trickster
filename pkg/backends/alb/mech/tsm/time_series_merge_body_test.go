@@ -125,7 +125,7 @@ func TestHandleResponseMergeBody(t *testing.T) {
 		if !strings.HasPrefix(body, "MERGED:series=") {
 			t.Fatalf("body: want MERGED:series= prefix, got %q", body)
 		}
-		seriesPart := body[len("MERGED:series=") : strings.Index(body, "|")]
+		seriesPart := body[len("MERGED:series="):strings.Index(body, "|")]
 		if !strings.Contains(seriesPart, "alpha") || !strings.Contains(seriesPart, "beta") {
 			t.Fatalf("series: want both markers (alpha, beta), got %q", seriesPart)
 		}
@@ -156,6 +156,24 @@ func TestHandleResponseMergeBody(t *testing.T) {
 		}
 		if status := w.Header().Get(headers.NameTricksterResult); !strings.Contains(status, "phit") {
 			t.Fatalf("%s header: want phit marker, got %q", headers.NameTricksterResult, status)
+		}
+	})
+
+	t.Run("all_members_without_merge_contribution_returns_502", func(t *testing.T) {
+		p, _, _ := albpool.NewHealthy([]http.Handler{
+			stubFailHandler(http.StatusInternalServerError),
+			stubFailHandler(http.StatusBadGateway),
+		})
+		defer p.Stop()
+		h := &handler{mergePaths: []string{"/"}}
+		h.SetPool(p)
+		p.RefreshHealthy()
+
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, newTestMergeRequest(t))
+
+		if w.Code != http.StatusBadGateway {
+			t.Fatalf("status: want %d got %d body=%q", http.StatusBadGateway, w.Code, w.Body.String())
 		}
 	})
 }
