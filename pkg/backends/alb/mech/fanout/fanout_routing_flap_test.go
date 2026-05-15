@@ -23,12 +23,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/pool"
 	"github.com/trickstercache/trickster/v2/pkg/backends/healthcheck"
-	"github.com/trickstercache/trickster/v2/pkg/observability/metrics"
 	"github.com/trickstercache/trickster/v2/pkg/testutil/albpool"
 )
 
@@ -56,17 +54,12 @@ func TestAllRoutingFlapAttributesFailure(t *testing.T) {
 
 	st.Set(healthcheck.StatusFailing)
 
-	before := testutil.ToFloat64(metrics.ALBFanoutFailures.WithLabelValues(mechName, "", "routing_flap"))
-	beforeTrunc := testutil.ToFloat64(metrics.ALBFanoutFailures.WithLabelValues(mechName, "", "truncated"))
-
 	parent := albpool.NewParentGET(t)
-	results, _ := All(context.Background(), parent, live, Config{Mechanism: mechName, MaxCaptureBytes: maxBytes})
-	require.Len(t, results, 1)
-	require.True(t, results[0].Failed, "slot must surface failure")
-
-	after := testutil.ToFloat64(metrics.ALBFanoutFailures.WithLabelValues(mechName, "", "routing_flap"))
-	afterTrunc := testutil.ToFloat64(metrics.ALBFanoutFailures.WithLabelValues(mechName, "", "truncated"))
-
-	require.Equal(t, before+1, after, "routing_flap should increment when dispatched target is now unhealthy")
-	require.Equal(t, beforeTrunc, afterTrunc, "truncated should NOT increment for routing-flap target")
+	albpool.RequireFanoutFailureDelta(t, mechName, "", "routing_flap", 1, func() {
+		albpool.RequireFanoutFailureDelta(t, mechName, "", "truncated", 0, func() {
+			results, _ := All(context.Background(), parent, live, Config{Mechanism: mechName, MaxCaptureBytes: maxBytes})
+			require.Len(t, results, 1)
+			require.True(t, results[0].Failed, "slot must surface failure")
+		})
+	})
 }

@@ -20,7 +20,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/trickstercache/trickster/v2/pkg/proxy/headers"
 	"github.com/trickstercache/trickster/v2/pkg/testutil/albpool"
@@ -34,43 +33,17 @@ func TestNLMPanicMemberDoesNotCrashRequest(t *testing.T) {
 	healthy := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set(headers.NameLastModified, lm)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("body-ok"))
-	})
-	panicker := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
-		panic("simulated upstream nil deref")
+		_, _ = w.Write([]byte("body-ok"))
 	})
 
-	p, _, _ := albpool.NewHealthy([]http.Handler{panicker, healthy})
+	p, _, _ := albpool.NewHealthy([]http.Handler{albpool.PanicHandler(), healthy})
 	defer p.Stop()
 	albpool.WaitHealthy(t, p, 2)
 
 	h := &handler{}
 	h.SetPool(p)
 	w := httptest.NewRecorder()
-	r := albpool.NewParentGET(t)
-
-	defer func() {
-		if rec := recover(); rec != nil {
-			t.Fatalf("unrecovered panic crossed ServeHTTP: %v", rec)
-		}
-	}()
-
-	done := make(chan struct{})
-	go func() {
-		defer func() {
-			if rec := recover(); rec != nil {
-				t.Errorf("unrecovered panic in goroutine: %v", rec)
-			}
-			close(done)
-		}()
-		h.ServeHTTP(w, r)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("ServeHTTP did not return after pool member panic")
-	}
+	albpool.ServeAndWait(t, h, w, albpool.NewParentGET(t))
 
 	if w.Body.String() != "body-ok" {
 		t.Errorf("expected healthy member body, got %q", w.Body.String())
@@ -78,39 +51,12 @@ func TestNLMPanicMemberDoesNotCrashRequest(t *testing.T) {
 }
 
 func TestNLMPanicAllMembersDoesNotCrashRequest(t *testing.T) {
-	panicker := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
-		panic("simulated upstream nil deref")
-	})
-
-	p, _, _ := albpool.NewHealthy([]http.Handler{panicker, panicker})
+	p, _, _ := albpool.NewHealthy([]http.Handler{albpool.PanicHandler(), albpool.PanicHandler()})
 	defer p.Stop()
 	albpool.WaitHealthy(t, p, 2)
 
 	h := &handler{}
 	h.SetPool(p)
 	w := httptest.NewRecorder()
-	r := albpool.NewParentGET(t)
-
-	defer func() {
-		if rec := recover(); rec != nil {
-			t.Fatalf("unrecovered panic crossed ServeHTTP: %v", rec)
-		}
-	}()
-
-	done := make(chan struct{})
-	go func() {
-		defer func() {
-			if rec := recover(); rec != nil {
-				t.Errorf("unrecovered panic in goroutine: %v", rec)
-			}
-			close(done)
-		}()
-		h.ServeHTTP(w, r)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("ServeHTTP did not return after all-panic fanout")
-	}
+	albpool.ServeAndWait(t, h, w, albpool.NewParentGET(t))
 }

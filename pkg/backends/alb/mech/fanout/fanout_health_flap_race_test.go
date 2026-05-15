@@ -26,17 +26,8 @@ import (
 
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/pool"
 	"github.com/trickstercache/trickster/v2/pkg/backends/healthcheck"
+	"github.com/trickstercache/trickster/v2/pkg/testutil/albpool"
 )
-
-func mkFlapTarget(t *testing.T) *pool.Target {
-	t.Helper()
-	st := &healthcheck.Status{}
-	st.Set(healthcheck.StatusPassing)
-	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	return pool.NewTarget(h, st, nil)
-}
 
 // TestAllRacesPerTargetHealthFlip races per-target hcStatus flips against
 // in-flight fanout.All invocations. The assertion is data-race freedom under
@@ -47,7 +38,7 @@ func TestAllRacesPerTargetHealthFlip(t *testing.T) {
 	const numTargets = 6
 	targets := make(pool.Targets, numTargets)
 	for i := range numTargets {
-		targets[i] = mkFlapTarget(t)
+		targets[i], _ = albpool.HealthyTarget(albpool.StatusHandler(http.StatusOK, ""))
 	}
 
 	stop := make(chan struct{})
@@ -79,7 +70,7 @@ func TestAllRacesPerTargetHealthFlip(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		parent := newParentGET(t)
+		parent := albpool.NewParentGET(t)
 		ctx := context.Background()
 		cfg := Config{Mechanism: "test"}
 		for {

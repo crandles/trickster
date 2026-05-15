@@ -21,13 +21,20 @@
 package albpool
 
 import (
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/pool"
 	"github.com/trickstercache/trickster/v2/pkg/backends/healthcheck"
+	"github.com/trickstercache/trickster/v2/pkg/observability/metrics"
 )
 
 // New constructs a pool with the given healthyFloor and one target per handler.
@@ -140,4 +147,146 @@ func NewParentPOST(t testing.TB, body io.Reader) *http.Request {
 func Target(h http.Handler) (*pool.Target, *healthcheck.Status) {
 	hst := &healthcheck.Status{}
 	return pool.NewTarget(h, hst, nil), hst
+}
+
+// HealthyTarget builds a single *pool.Target with its status pre-set to
+// StatusPassing. Replaces the mkFlapTarget pattern (target + Set passing)
+// duplicated across fanout/* tests.
+func HealthyTarget(h http.Handler) (*pool.Target, *healthcheck.Status) {
+	tgt, st := Target(h)
+	st.Set(healthcheck.StatusPassing)
+	return tgt, st
+}
+
+// PanicHandler returns an http.Handler that panics with the canonical
+// simulated-upstream string. Used by FR/NLM/TSM panic regression tests to
+// verify mechanism recover wraps swallow the panic without crossing
+// ServeHTTP.
+func PanicHandler() http.Handler {
+	return http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		panic("simulated upstream nil deref")
+	})
+}
+
+// SizedBodyHandler returns an http.Handler that emits a body of size bytes
+// (filled with 'a') under an explicit Content-Length: size header with the
+// given status code. Exercises the truncated-upstream defense in FR/NLM/TSM
+// when MaxCaptureBytes is below size.
+func SizedBodyHandler(code, size int) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		body := make([]byte, size)
+		for i := range body {
+			body[i] = 'a'
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		w.WriteHeader(code)
+		_, _ = w.Write(body)
+	})
+}
+
+// ServeAndWait runs h.ServeHTTP(w, r) in a goroutine with a deferred recover
+// (panic reported via t.Errorf) and asserts the call returns within 5s.
+// Replaces the done-chan + select boilerplate duplicated across
+// `*_panic_test.go`. Callers retain ownership of post-call status/body
+// assertions.
+func ServeAndWait(t testing.TB, h http.Handler, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				t.Errorf("unrecovered panic in ServeHTTP goroutine: %v", rec)
+			}
+			close(done)
+		}()
+		h.ServeHTTP(w, r)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeHTTP did not return within 5s")
+	}
+}
+
+// RunPostBodyFanoutRace builds a `slots`-upstream pool whose stubs verify the
+// parent body arrives intact, then drives `callers` parallel POSTs against
+// the handler returned by mkHandler(p). Each upstream optionally invokes
+// decorateResp before WriteHeader (eg to set Last-Modified for NLM). Run
+// under -race to catch parent-body fanout regressions. Replaces the
+// drivers duplicated across `*_post_race_test.go`.
+func RunPostBodyFanoutRace(
+	t testing.TB,
+	mkHandler func(p pool.Pool) http.Handler,
+	body string,
+	slots, callers int,
+	decorateResp func(w http.ResponseWriter),
+) {
+	t.Helper()
+	mkStub := func(name string) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			if string(b) != body {
+				t.Errorf("%s: truncated body, got %d bytes want %d", name, len(b), len(body))
+			}
+			if decorateResp != nil {
+				decorateResp(w)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(name))
+		})
+	}
+	hs := make([]http.Handler, slots)
+	for i := range hs {
+		hs[i] = mkStub(fmt.Sprintf("slot-%d", i))
+	}
+	p, _, _ := NewHealthy(hs)
+	defer p.Stop()
+	WaitHealthy(t, p, slots)
+	h := mkHandler(p)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Go(func() {
+			r, err := http.NewRequest(http.MethodPost,
+				"https://trickstercache.org/api/v1/query_range", strings.NewReader(body))
+			if err != nil {
+				t.Errorf("NewRequest: %v", err)
+				return
+			}
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != http.StatusOK {
+				t.Errorf("status %d", w.Code)
+			}
+		})
+	}
+	wg.Wait()
+}
+
+// RequireFanoutAttemptDelta runs fn and asserts that the
+// metrics.ALBFanoutAttempts counter for (mech, variant) advanced by want.
+// Replaces hand-rolled testutil.ToFloat64 before/after subtraction.
+func RequireFanoutAttemptDelta(t testing.TB, mech, variant string, want float64, fn func()) {
+	t.Helper()
+	before := testutil.ToFloat64(metrics.ALBFanoutAttempts.WithLabelValues(mech, variant))
+	fn()
+	after := testutil.ToFloat64(metrics.ALBFanoutAttempts.WithLabelValues(mech, variant))
+	if got := after - before; got != want {
+		t.Errorf("ALBFanoutAttempts{mech=%q,variant=%q} delta = %v, want %v",
+			mech, variant, got, want)
+	}
+}
+
+// RequireFanoutFailureDelta runs fn and asserts that the
+// metrics.ALBFanoutFailures counter for (mech, variant, reason) advanced by
+// want.
+func RequireFanoutFailureDelta(t testing.TB, mech, variant, reason string, want float64, fn func()) {
+	t.Helper()
+	before := testutil.ToFloat64(metrics.ALBFanoutFailures.WithLabelValues(mech, variant, reason))
+	fn()
+	after := testutil.ToFloat64(metrics.ALBFanoutFailures.WithLabelValues(mech, variant, reason))
+	if got := after - before; got != want {
+		t.Errorf("ALBFanoutFailures{mech=%q,variant=%q,reason=%q} delta = %v, want %v",
+			mech, variant, reason, got, want)
+	}
 }

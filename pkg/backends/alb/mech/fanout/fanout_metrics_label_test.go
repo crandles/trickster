@@ -21,12 +21,10 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/names"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/pool"
-	"github.com/trickstercache/trickster/v2/pkg/observability/metrics"
 	"github.com/trickstercache/trickster/v2/pkg/testutil/albpool"
 )
 
@@ -44,21 +42,15 @@ func TestFanoutMetricLabels(t *testing.T) {
 	const n = 3
 	targets := make(pool.Targets, n)
 	for i := range n {
-		targets[i], _ = albpool.Target(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ok"))
-		}))
+		targets[i], _ = albpool.Target(albpool.StatusHandler(http.StatusOK, "ok"))
 	}
 
-	before := testutil.ToFloat64(metrics.ALBFanoutAttempts.WithLabelValues(mech, variant))
-
 	parent := albpool.NewParentGET(t)
-	results, err := All(context.Background(), parent, targets, Config{Mechanism: mech, Variant: variant})
-	require.NoError(t, err)
-	require.Len(t, results, n)
-
-	after := testutil.ToFloat64(metrics.ALBFanoutAttempts.WithLabelValues(mech, variant))
-	require.Equal(t, before+1, after, "attempts should increment exactly once per fanout call, not per slot")
+	albpool.RequireFanoutAttemptDelta(t, mech, variant, 1, func() {
+		results, err := All(context.Background(), parent, targets, Config{Mechanism: mech, Variant: variant})
+		require.NoError(t, err)
+		require.Len(t, results, n)
+	})
 
 	require.Equal(t, "fr", names.MechanismFR, "fanout test asserts on the canonical short-name; constant drift would silently break dashboards")
 }

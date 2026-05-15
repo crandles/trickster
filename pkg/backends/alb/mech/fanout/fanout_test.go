@@ -40,11 +40,6 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-// shim kept for fanout_health_flap_race_test.go which still references it.
-func newParentGET(t *testing.T) *http.Request {
-	return albpool.NewParentGET(t)
-}
-
 func TestAllOrderedResults(t *testing.T) {
 	const n = 5
 	targets := make(pool.Targets, n)

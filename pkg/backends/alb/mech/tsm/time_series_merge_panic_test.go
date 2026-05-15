@@ -20,7 +20,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/trickstercache/trickster/v2/pkg/proxy/request"
 	tu "github.com/trickstercache/trickster/v2/pkg/testutil"
@@ -31,88 +30,34 @@ import (
 // ...) at time_series_merge.go must catch it and mark the slot failed so the
 // merge surfaces the partial-failure (phit) signal.
 func TestTSMPanicMemberDoesNotCrashRequest(t *testing.T) {
-	panicker := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
-		panic("simulated upstream nil deref")
-	})
-
 	p, _, _ := albpool.NewHealthy([]http.Handler{
 		http.HandlerFunc(tu.BasicHTTPHandler),
-		panicker,
+		albpool.PanicHandler(),
 	})
 	defer p.Stop()
 	albpool.WaitHealthy(t, p, 2)
 
 	rsc := request.NewResources(nil, nil, nil, nil, nil, nil)
 	rsc.IsMergeMember = true
-	r := albpool.NewParentGET(t)
-	r = request.SetResources(r, rsc)
+	r := request.SetResources(albpool.NewParentGET(t), rsc)
 
 	h := &handler{mergePaths: []string{"/"}}
 	h.SetPool(p)
 	w := httptest.NewRecorder()
-
-	defer func() {
-		if rec := recover(); rec != nil {
-			t.Fatalf("unrecovered panic crossed ServeHTTP: %v", rec)
-		}
-	}()
-
-	done := make(chan struct{})
-	go func() {
-		defer func() {
-			if rec := recover(); rec != nil {
-				t.Errorf("unrecovered panic in goroutine: %v", rec)
-			}
-			close(done)
-		}()
-		h.ServeHTTP(w, r)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("ServeHTTP did not return after panic")
-	}
+	albpool.ServeAndWait(t, h, w, r)
 }
 
 func TestTSMPanicAllMembersDoesNotCrashRequest(t *testing.T) {
-	panicker := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
-		panic("simulated upstream nil deref")
-	})
-
-	p, _, _ := albpool.NewHealthy([]http.Handler{panicker, panicker})
+	p, _, _ := albpool.NewHealthy([]http.Handler{albpool.PanicHandler(), albpool.PanicHandler()})
 	defer p.Stop()
 	albpool.WaitHealthy(t, p, 2)
 
 	rsc := request.NewResources(nil, nil, nil, nil, nil, nil)
 	rsc.IsMergeMember = true
-	r := albpool.NewParentGET(t)
-	r = request.SetResources(r, rsc)
+	r := request.SetResources(albpool.NewParentGET(t), rsc)
 
 	h := &handler{mergePaths: []string{"/"}}
 	h.SetPool(p)
 	w := httptest.NewRecorder()
-
-	defer func() {
-		if rec := recover(); rec != nil {
-			t.Fatalf("unrecovered panic crossed ServeHTTP: %v", rec)
-		}
-	}()
-
-	done := make(chan struct{})
-	go func() {
-		defer func() {
-			if rec := recover(); rec != nil {
-				t.Errorf("unrecovered panic in goroutine: %v", rec)
-			}
-			close(done)
-		}()
-		h.ServeHTTP(w, r)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("ServeHTTP did not return after all-panic fanout")
-	}
+	albpool.ServeAndWait(t, h, w, r)
 }

@@ -17,17 +17,12 @@
 package tsm
 
 import (
-	"encoding/json"
-	"flag"
-	"os"
-	"path/filepath"
 	"testing"
 
+	"github.com/trickstercache/trickster/v2/pkg/testutil/golden"
 	"github.com/trickstercache/trickster/v2/pkg/timeseries/dataset"
 	"github.com/trickstercache/trickster/v2/pkg/timeseries/epoch"
 )
-
-var updateGolden = flag.Bool("update", false, "rewrite testdata/*.json fixtures from current test output")
 
 // goldenPoint is the on-disk representation of dataset.Point. We use a local
 // type because dataset.Point.Values is []any -- json round-trips strings as
@@ -116,30 +111,12 @@ func fromGolden(g goldenDataSet) *dataset.DataSet {
 
 func loadGoldenDataSet(t testing.TB, name string) *dataset.DataSet {
 	t.Helper()
-	path := filepath.Join("testdata", name+".json")
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read golden %s: %v (run with -update to create)", path, err)
-	}
 	var g goldenDataSet
-	if err := json.Unmarshal(b, &g); err != nil {
-		t.Fatalf("unmarshal golden %s: %v", path, err)
-	}
+	golden.LoadJSON(t, name, &g)
 	return fromGolden(g)
 }
 
 func writeGoldenDataSet(t testing.TB, name string, ds *dataset.DataSet) {
 	t.Helper()
-	path := filepath.Join("testdata", name+".json")
-	b, err := json.MarshalIndent(toGolden(ds), "", "  ")
-	if err != nil {
-		t.Fatalf("marshal %s: %v", path, err)
-	}
-	b = append(b, '\n')
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
-	}
-	if err := os.WriteFile(path, b, 0o644); err != nil {
-		t.Fatalf("write %s: %v", path, err)
-	}
+	golden.WriteJSON(t, name, toGolden(ds))
 }

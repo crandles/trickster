@@ -19,28 +19,11 @@ package fr
 import (
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"testing"
 
 	"github.com/trickstercache/trickster/v2/pkg/testutil/albpool"
 	"github.com/trickstercache/trickster/v2/pkg/util/sets"
 )
-
-// oversized writes a body larger than MaxCaptureBytes. The capture writer
-// truncates silently and reports Truncated()=true. Without the disqualify
-// fix, FR's CAS path claims this member and serves a partial body under the
-// original Content-Length header.
-func oversizedHandler(code int, size int) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		body := make([]byte, size)
-		for i := range body {
-			body[i] = 'a'
-		}
-		w.Header().Set("Content-Length", strconv.Itoa(size))
-		w.WriteHeader(code)
-		w.Write(body)
-	})
-}
 
 // TestFRDisqualifiesTruncatedWinner asserts that FR (FGR variant) does not
 // claim a member whose response exceeded MaxCaptureBytes. Both members emit
@@ -51,8 +34,8 @@ func TestFRDisqualifiesTruncatedWinner(t *testing.T) {
 	const bodySize = 1024
 
 	hs := []http.Handler{
-		oversizedHandler(http.StatusOK, bodySize),
-		oversizedHandler(http.StatusOK, bodySize),
+		albpool.SizedBodyHandler(http.StatusOK, bodySize),
+		albpool.SizedBodyHandler(http.StatusOK, bodySize),
 	}
 	p, _, _ := albpool.New(-1, hs)
 	defer p.Stop()
@@ -88,8 +71,8 @@ func TestFRTruncatedAllMembersFallback(t *testing.T) {
 	const bodySize = 1024
 
 	hs := []http.Handler{
-		oversizedHandler(http.StatusOK, bodySize),
-		oversizedHandler(http.StatusOK, bodySize),
+		albpool.SizedBodyHandler(http.StatusOK, bodySize),
+		albpool.SizedBodyHandler(http.StatusOK, bodySize),
 	}
 	p, _, _ := albpool.New(-1, hs)
 	defer p.Stop()
@@ -114,13 +97,9 @@ func TestFRTruncatedAllMembersFallback(t *testing.T) {
 func TestFRPrefersIntactOverTruncated(t *testing.T) {
 	const maxBytes = 64
 
-	intact := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	})
 	hs := []http.Handler{
-		oversizedHandler(http.StatusOK, 4096),
-		intact,
+		albpool.SizedBodyHandler(http.StatusOK, 4096),
+		albpool.StatusHandler(http.StatusOK, "ok"),
 	}
 	p, _, _ := albpool.New(-1, hs)
 	defer p.Stop()

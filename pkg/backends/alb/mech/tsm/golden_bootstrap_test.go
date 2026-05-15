@@ -19,6 +19,7 @@ package tsm
 import (
 	"testing"
 
+	"github.com/trickstercache/trickster/v2/pkg/testutil/golden"
 	"github.com/trickstercache/trickster/v2/pkg/timeseries/dataset"
 	"github.com/trickstercache/trickster/v2/pkg/timeseries/epoch"
 )
@@ -51,7 +52,7 @@ func dsWith(series ...*dataset.Series) *dataset.DataSet {
 // runs skip it. After regeneration, the produced JSON is the canonical input
 // for the migrated weighted-avg tests.
 func TestGenerateGoldenFixtures(t *testing.T) {
-	if !*updateGolden {
+	if !*golden.Update {
 		t.Skip("pass -update to regenerate testdata fixtures")
 	}
 	type pt = struct {
