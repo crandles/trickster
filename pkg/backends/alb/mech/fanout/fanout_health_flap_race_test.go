@@ -42,7 +42,7 @@ func TestAllRacesPerTargetHealthFlip(t *testing.T) {
 	}
 
 	stop := make(chan struct{})
-	var flipperIters, fanoutIters atomic.Int64
+	var flipperIters, fanoutIters, succeededSlots atomic.Int64
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -79,7 +79,12 @@ func TestAllRacesPerTargetHealthFlip(t *testing.T) {
 				return
 			default:
 			}
-			_, _ = All(ctx, parent, targets, cfg)
+			results, _ := All(ctx, parent, targets, cfg)
+			for _, r := range results {
+				if !r.Failed {
+					succeededSlots.Add(1)
+				}
+			}
 			fanoutIters.Add(1)
 		}
 	}()
@@ -98,6 +103,9 @@ func TestAllRacesPerTargetHealthFlip(t *testing.T) {
 			}
 			if flipperIters.Load() == 0 {
 				t.Fatal("no flipper iterations completed")
+			}
+			if succeededSlots.Load() == 0 {
+				t.Fatal("no fanout slot succeeded; flapper starved every dispatch")
 			}
 			return
 		default:

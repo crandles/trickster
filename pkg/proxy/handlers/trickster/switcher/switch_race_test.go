@@ -28,8 +28,16 @@ import (
 func TestSwitchHandlerConcurrentUpdateReadIsRaceFree(t *testing.T) {
 	t.Parallel()
 
-	initial := http.NewServeMux()
-	sh := NewSwitchHandler(initial)
+	var served atomic.Int64
+	makeMux := func() http.Handler {
+		m := http.NewServeMux()
+		m.HandleFunc("/", func(_ http.ResponseWriter, _ *http.Request) {
+			served.Add(1)
+		})
+		return m
+	}
+
+	sh := NewSwitchHandler(makeMux())
 
 	var stop atomic.Bool
 	var wg sync.WaitGroup
@@ -39,7 +47,7 @@ func TestSwitchHandlerConcurrentUpdateReadIsRaceFree(t *testing.T) {
 	for range writers {
 		wg.Go(func() {
 			for !stop.Load() {
-				sh.Update(http.NewServeMux())
+				sh.Update(makeMux())
 			}
 		})
 	}
@@ -57,4 +65,7 @@ func TestSwitchHandlerConcurrentUpdateReadIsRaceFree(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	stop.Store(true)
 	wg.Wait()
+	if served.Load() == 0 {
+		t.Fatal("no requests served; readers never reached a non-nil handler")
+	}
 }

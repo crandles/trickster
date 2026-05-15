@@ -17,6 +17,7 @@
 package tsm
 
 import (
+	"os"
 	"testing"
 
 	"github.com/trickstercache/trickster/v2/pkg/testutil/golden"
@@ -54,6 +55,11 @@ func dsWith(series ...*dataset.Series) *dataset.DataSet {
 func TestGenerateGoldenFixtures(t *testing.T) {
 	if !*golden.Update {
 		t.Skip("pass -update to regenerate testdata fixtures")
+	}
+	// Require TRICKSTER_REGEN_GOLDENS=1 in addition to -update so a repo-wide
+	// `go test -update ./...` can't silently overwrite these fixtures.
+	if os.Getenv("TRICKSTER_REGEN_GOLDENS") != "1" {
+		t.Skip("set TRICKSTER_REGEN_GOLDENS=1 to regenerate")
 	}
 	type pt = struct {
 		e int64
