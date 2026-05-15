@@ -17,11 +17,10 @@
 package engines
 
 import (
-	"runtime/debug"
-
 	"github.com/trickstercache/trickster/v2/pkg/observability/logging"
 	"github.com/trickstercache/trickster/v2/pkg/observability/logging/logger"
 	"github.com/trickstercache/trickster/v2/pkg/observability/metrics"
+	"github.com/trickstercache/trickster/v2/pkg/util/safego"
 )
 
 // goWithRecover runs fn in a new goroutine guarded by defer-recover. A panic
@@ -31,23 +30,12 @@ import (
 // frame above it to absorb the panic. The site label is recorded on the
 // ProxyEnginesPanicRecovered counter so operators can localize the failure.
 func goWithRecover(site string, fn func()) {
-	go runWithRecover(site, fn)
-}
-
-// runWithRecover runs fn synchronously, recovering any panic and recording it
-// on the ProxyEnginesPanicRecovered counter. Exposed for sites that already
-// have a goroutine wrapper (e.g. deferred Cleanups inside an existing
-// goroutine body) and for unit tests.
-func runWithRecover(site string, fn func()) {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Error("proxy engines goroutine panic", logging.Pairs{
-				"site":  site,
-				"panic": r,
-				"stack": string(debug.Stack()),
-			})
-			metrics.ProxyEnginesPanicRecovered.WithLabelValues(site).Inc()
-		}
-	}()
-	fn()
+	safego.Go(func(r any, stack []byte) {
+		logger.Error("proxy engines goroutine panic", logging.Pairs{
+			"site":  site,
+			"panic": r,
+			"stack": string(stack),
+		})
+		metrics.ProxyEnginesPanicRecovered.WithLabelValues(site).Inc()
+	}, fn)
 }

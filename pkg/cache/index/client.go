@@ -31,6 +31,7 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/observability/logging/logger"
 	gm "github.com/trickstercache/trickster/v2/pkg/observability/metrics"
 	"github.com/trickstercache/trickster/v2/pkg/util/atomicx"
+	"github.com/trickstercache/trickster/v2/pkg/util/safego"
 )
 
 //go:generate go tool msgp
@@ -314,38 +315,46 @@ func (idx *IndexedClient) Close() error {
 // flusher periodically calls the cache's index flush func that writes the cache index to disk
 func (idx *IndexedClient) flusher(ctx context.Context) {
 	defer idx.wg.Done()
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Error("cache index flusher panic", logging.Pairs{
-				"cacheName": idx.name,
-				"worker":    "flusher",
-				"panic":     r,
-			})
-			gm.CacheIndexPanicRecovered.WithLabelValues("flusher").Inc()
-			idx.flusherExited.Store(true)
-		}
-	}()
-FLUSHER:
-	for {
-		fi := idx.options.Load().(*options.Options).FlushInterval
-		select {
-		case <-ctx.Done():
-			break FLUSHER
-		case <-time.After(fi):
-			if idx.lastWrite.Load().Before(idx.LastFlush.Load()) {
-				continue
+	safego.Run(idx.workerPanicHandler("flusher", &idx.flusherExited), func() {
+	FLUSHER:
+		for {
+			fi := idx.options.Load().(*options.Options).FlushInterval
+			select {
+			case <-ctx.Done():
+				break FLUSHER
+			case <-time.After(fi):
+				if idx.lastWrite.Load().Before(idx.LastFlush.Load()) {
+					continue
+				}
+			case <-idx.forceFlush:
 			}
-		case <-idx.forceFlush:
+			idx.flushOnce()
+			select {
+			case idx.hasFlushed <- true:
+				// signal that a flush has occurred
+			default:
+				// drop message if no listener
+			}
 		}
-		idx.flushOnce()
-		select {
-		case idx.hasFlushed <- true:
-			// signal that a flush has occurred
-		default:
-			// drop message if no listener
-		}
+		idx.flusherExited.Store(true)
+	})
+}
+
+// workerPanicHandler returns a safego.PanicHandler that logs the panic
+// with the worker label, increments CacheIndexPanicRecovered, and flips
+// the supplied exited flag so the operator-facing health endpoint can
+// surface the dead worker. Used by both flusher and reaper.
+func (idx *IndexedClient) workerPanicHandler(worker string, exited *atomic.Bool) safego.PanicHandler {
+	return func(r any, stack []byte) {
+		logger.Error("cache index "+worker+" panic", logging.Pairs{
+			"cacheName": idx.name,
+			"worker":    worker,
+			"panic":     r,
+			"stack":     string(stack),
+		})
+		gm.CacheIndexPanicRecovered.WithLabelValues(worker).Inc()
+		exited.Store(true)
 	}
-	idx.flusherExited.Store(true)
 }
 
 // clone the msgpack encoded fields of the IndexedClient structure
@@ -378,35 +387,26 @@ func (idx *IndexedClient) flushOnce() {
 // reaper continually iterates through the cache to find expired elements and removes them
 func (idx *IndexedClient) reaper(ctx context.Context) {
 	defer idx.wg.Done()
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Error("cache index reaper panic", logging.Pairs{
-				"cacheName": idx.name,
-				"worker":    "reaper",
-				"panic":     r,
-			})
-			gm.CacheIndexPanicRecovered.WithLabelValues("reaper").Inc()
-			idx.reaperExited.Store(true)
+	safego.Run(idx.workerPanicHandler("reaper", &idx.reaperExited), func() {
+	REAPER:
+		for {
+			ri := idx.options.Load().(*options.Options).ReapInterval
+			select {
+			case <-ctx.Done():
+				break REAPER
+			case <-time.After(ri):
+			case <-idx.forceReap:
+			}
+			idx.reap()
+			select {
+			case idx.hasReaped <- true:
+				// signal that a reap has occurred
+			default:
+				// drop message if no listener
+			}
 		}
-	}()
-REAPER:
-	for {
-		ri := idx.options.Load().(*options.Options).ReapInterval
-		select {
-		case <-ctx.Done():
-			break REAPER
-		case <-time.After(ri):
-		case <-idx.forceReap:
-		}
-		idx.reap()
-		select {
-		case idx.hasReaped <- true:
-			// signal that a reap has occurred
-		default:
-			// drop message if no listener
-		}
-	}
-	idx.reaperExited.Store(true)
+		idx.reaperExited.Store(true)
+	})
 }
 
 // reap makes a single iteration through the cache index to to find and remove expired elements

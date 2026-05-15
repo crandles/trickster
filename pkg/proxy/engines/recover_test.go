@@ -43,31 +43,6 @@ func counterValue(t *testing.T, vec *prometheus.CounterVec, labels ...string) fl
 	return *m.Counter.Value
 }
 
-// TestRunWithRecoverAbsorbsPanic asserts the synchronous helper recovers any
-// panic from the wrapped fn, increments ProxyEnginesPanicRecovered{site=...},
-// and lets the caller continue running.
-func TestRunWithRecoverAbsorbsPanic(t *testing.T) {
-	t.Parallel()
-
-	before := counterValue(t, metrics.ProxyEnginesPanicRecovered, "test.sync")
-
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Fatalf("panic escaped runWithRecover: %v", r)
-			}
-		}()
-		runWithRecover("test.sync", func() {
-			panic("simulated proxy/engines panic")
-		})
-	}()
-
-	after := counterValue(t, metrics.ProxyEnginesPanicRecovered, "test.sync")
-	if got := after - before; got != 1 {
-		t.Fatalf("expected ProxyEnginesPanicRecovered{site=test.sync} +1, got +%v", got)
-	}
-}
-
 // TestGoWithRecoverAsyncPanic asserts the goroutine helper recovers panics
 // spawned in fire-and-forget goroutines (the actual shape used at every call
 // site in this package). We can't close a sync channel from inside the

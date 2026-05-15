@@ -30,6 +30,7 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/observability/logging/logger"
 	"github.com/trickstercache/trickster/v2/pkg/observability/metrics"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/headers"
+	"github.com/trickstercache/trickster/v2/pkg/util/safego"
 )
 
 const (
@@ -109,19 +110,18 @@ func (s *Status) Set(i int32) {
 // isolated by recover so a closed-channel panic on one subscriber does not
 // stop notifying the rest or propagate up to the probe loop caller.
 func (s *Status) notifySubscriber(ch chan bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Error("healthcheck status notify panic", logging.Pairs{
-				"target": s.name,
-				"panic":  fmt.Sprintf("%v", r),
-			})
-			metrics.HealthcheckStatusNotifyPanicRecovered.WithLabelValues(s.name).Inc()
+	safego.Run(func(r any, _ []byte) {
+		logger.Error("healthcheck status notify panic", logging.Pairs{
+			"target": s.name,
+			"panic":  fmt.Sprintf("%v", r),
+		})
+		metrics.HealthcheckStatusNotifyPanicRecovered.WithLabelValues(s.name).Inc()
+	}, func() {
+		select {
+		case ch <- true:
+		default:
 		}
-	}()
-	select {
-	case ch <- true:
-	default:
-	}
+	})
 }
 
 // Prober returns the Prober func

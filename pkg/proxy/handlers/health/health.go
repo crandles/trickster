@@ -41,6 +41,7 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/observability/metrics"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/contenttype"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/headers"
+	"github.com/trickstercache/trickster/v2/pkg/util/safego"
 	"github.com/trickstercache/trickster/v2/pkg/util/sets"
 	"gopkg.in/yaml.v2"
 )
@@ -163,21 +164,21 @@ func StatusHandler(now func() time.Time, hc healthcheck.HealthChecker, backends 
 	if now == nil {
 		now = time.Now
 	}
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				logger.Error("health status builder panic", logging.Pairs{
-					"panic": r,
-				})
-				metrics.HealthHandlerPanicRecovered.Inc()
-				select {
-				case ready <- true:
-				default:
-				}
-			}
-		}()
+	safego.Go(func(r any, stack []byte) {
+		logger.Error("health status builder panic", logging.Pairs{
+			"panic": r,
+			"stack": string(stack),
+		})
+		metrics.HealthHandlerPanicRecovered.Inc()
+		// Unblock the wait below so a panic on the first builder cycle
+		// doesn't leave the handler hung forever.
+		select {
+		case ready <- true:
+		default:
+		}
+	}, func() {
 		builder(now, hc, hd, backends, ready)
-	}()
+	})
 	<-ready // wait for the builder to be ready before returning the handler
 
 	// the handler, when requested, simply prints out the static text stored in the healthDetail

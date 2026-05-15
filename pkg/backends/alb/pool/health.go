@@ -17,11 +17,10 @@
 package pool
 
 import (
-	"runtime/debug"
-
 	"github.com/trickstercache/trickster/v2/pkg/observability/logging"
 	"github.com/trickstercache/trickster/v2/pkg/observability/logging/logger"
 	"github.com/trickstercache/trickster/v2/pkg/observability/metrics"
+	"github.com/trickstercache/trickster/v2/pkg/util/safego"
 )
 
 // runWithRecover runs fn under defer-recover. A panic inside a refresh worker
@@ -33,17 +32,14 @@ import (
 // hcStatus is mutated to nil concurrent with RefreshHealthy, and any future
 // subscriber callback added to the status-update path that could panic.
 func (p *pool) runWithRecover(worker string, fn func()) {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Error("alb pool refresh worker panic", logging.Pairs{
-				"worker": worker,
-				"panic":  r,
-				"stack":  string(debug.Stack()),
-			})
-			metrics.ALBPoolRefreshPanicRecovered.WithLabelValues(worker).Inc()
-		}
-	}()
-	fn()
+	safego.Run(func(r any, stack []byte) {
+		logger.Error("alb pool refresh worker panic", logging.Pairs{
+			"worker": worker,
+			"panic":  r,
+			"stack":  string(stack),
+		})
+		metrics.ALBPoolRefreshPanicRecovered.WithLabelValues(worker).Inc()
+	}, fn)
 }
 
 // listenStatusUpdates bridges target health-status notifications into refresh
