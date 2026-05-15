@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/common/sigv4"
 	bo "github.com/trickstercache/trickster/v2/pkg/backends/options"
 	tlstest "github.com/trickstercache/trickster/v2/pkg/testutil/tls"
 )
@@ -250,4 +251,31 @@ func TestNewHTTPClient_TransportDisablesH2(t *testing.T) {
 	if len(tr.TLSNextProto) != 0 {
 		t.Errorf("TLSNextProto should be empty, got %d entries", len(tr.TLSNextProto))
 	}
+}
+
+// TestNewHTTPClient_SigV4WrapsIdleCloser asserts that when SigV4 signing is
+// configured, the resulting client's Transport still satisfies the
+// idleCloser interface used by backends.CloseIdleConnections during config
+// reload. The upstream sigV4RoundTripper from prometheus/common does not
+// implement CloseIdleConnections; without our wrapper, a reload sweep would
+// silently skip SigV4 backends and leak their idle connections.
+func TestNewHTTPClient_SigV4WrapsIdleCloser(t *testing.T) {
+	o := bo.New()
+	// Static credentials skip the AWS credential-provider chain lookup, which
+	// would fail in unit-test env without ~/.aws or env vars.
+	o.SigV4 = &sigv4.SigV4Config{
+		Region:    "us-east-1",
+		AccessKey: "AKIATEST",
+		SecretKey: "secrettest",
+	}
+	c, err := NewHTTPClient(o)
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+	type idleCloser interface{ CloseIdleConnections() }
+	if _, ok := c.Transport.(idleCloser); !ok {
+		t.Fatalf("SigV4 client Transport %T does not satisfy idleCloser", c.Transport)
+	}
+	// And it must not panic.
+	c.Transport.(idleCloser).CloseIdleConnections()
 }

@@ -103,12 +103,34 @@ func NewHTTPClient(o *bo.Options) (*http.Client, error) {
 	}
 
 	if o.SigV4 != nil {
-		var err error
-		client.Transport, err = sigv4.NewSigV4RoundTripper(o.SigV4, client.Transport)
+		inner, _ := client.Transport.(*http.Transport)
+		wrapped, err := sigv4.NewSigV4RoundTripper(o.SigV4, client.Transport)
 		if err != nil {
 			return nil, err
 		}
+		// sigV4RoundTripper does not implement CloseIdleConnections, so a
+		// reload-time backends.CloseIdleConnections sweep would silently
+		// skip SigV4-signed transports and leak their idle conns. Preserve
+		// the close path by wrapping the signed RoundTripper alongside its
+		// inner *http.Transport.
+		client.Transport = &idleClosingRoundTripper{RoundTripper: wrapped, inner: inner}
 	}
 
 	return client, nil
+}
+
+// idleClosingRoundTripper wraps an http.RoundTripper that doesn't itself
+// implement CloseIdleConnections so the inner *http.Transport's idle
+// conns are still reachable via the standard idleCloser interface used
+// by backends.CloseIdleConnections during config reload.
+type idleClosingRoundTripper struct {
+	http.RoundTripper
+	inner *http.Transport
+}
+
+// CloseIdleConnections forwards to the inner *http.Transport.
+func (i *idleClosingRoundTripper) CloseIdleConnections() {
+	if i.inner != nil {
+		i.inner.CloseIdleConnections()
+	}
 }
