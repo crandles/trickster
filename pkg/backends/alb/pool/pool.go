@@ -122,7 +122,7 @@ func (p *pool) Targets() Targets {
 	hl := p.snapshot()
 	live := make(Targets, 0, len(hl))
 	for _, t := range hl {
-		if t == nil || int(t.hcStatus.Get()) < p.healthyFloor {
+		if t == nil || t.hcStatus == nil || int(t.hcStatus.Get()) < p.healthyFloor {
 			continue
 		}
 		live = append(live, t)

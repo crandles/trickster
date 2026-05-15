@@ -277,14 +277,15 @@ func scatter(ctx context.Context, parent *http.Request, targets pool.Targets, cf
 			results[i].Capture = crw
 
 			targets[i].Handler().ServeHTTP(crw, r2)
-			if crw.Truncated() {
-				results[i].Failed = true
-				reason := failureReason(targets[i], "truncated")
-				metrics.ALBFanoutFailures.WithLabelValues(cfg.Mechanism, cfg.Variant, reason).Inc()
-			}
+			// short_read wins over truncated; both can be true for the same
+			// slot and double-counting distorts dashboards.
 			if capt := request.GetUpstreamShortReadCapture(r2.Context()); capt != nil && capt.Tripped() {
 				results[i].Failed = true
 				reason := failureReason(targets[i], "short_read")
+				metrics.ALBFanoutFailures.WithLabelValues(cfg.Mechanism, cfg.Variant, reason).Inc()
+			} else if crw.Truncated() {
+				results[i].Failed = true
+				reason := failureReason(targets[i], "truncated")
 				metrics.ALBFanoutFailures.WithLabelValues(cfg.Mechanism, cfg.Variant, reason).Inc()
 			}
 			if perSlot != nil {
