@@ -248,12 +248,15 @@ func TestEngines_Collapse_MetricsReport(t *testing.T) {
 	wg.Wait()
 	require.Equal(t, int32(1), counter.Load(), "collapse must hit origin exactly once")
 
-	// Metrics are incremented after the response is flushed.
+	// Metrics are incremented after the response is flushed. Window is
+	// generous because CI runners under -race + cgroup CPU limits routinely
+	// take an order of magnitude longer than local runs to flush 20 shared
+	// singleflight responses and scrape /metrics.
 	var after float64
 	require.Eventually(t, func() bool {
 		after = readProxyHitCount(t)
 		return after-before >= float64(n-1)
-	}, 3*time.Second, 50*time.Millisecond,
+	}, 15*time.Second, 25*time.Millisecond,
 		"proxy-hit metric did not reach expected delta (before=%v)", before)
 
 	require.InDelta(t, float64(n-1), after-before, 0.0001,
