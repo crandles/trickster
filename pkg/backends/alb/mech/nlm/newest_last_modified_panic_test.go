@@ -58,5 +58,10 @@ func TestNLMPanicAllMembersDoesNotCrashRequest(t *testing.T) {
 	h := &handler{}
 	h.SetPool(p)
 	w := httptest.NewRecorder()
-	albpool.ServeAndWait(t, h, w, albpool.NewParentGET(t))
+	albpool.RequireFanoutFailureDelta(t, "nlm", "", "panic", 2, func() {
+		albpool.ServeAndWait(t, h, w, albpool.NewParentGET(t))
+	})
+	if w.Code < 500 {
+		t.Errorf("expected 5xx, got %d", w.Code)
+	}
 }

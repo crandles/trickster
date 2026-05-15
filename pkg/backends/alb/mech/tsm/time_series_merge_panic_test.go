@@ -59,5 +59,10 @@ func TestTSMPanicAllMembersDoesNotCrashRequest(t *testing.T) {
 	h := &handler{mergePaths: []string{"/"}}
 	h.SetPool(p)
 	w := httptest.NewRecorder()
-	albpool.ServeAndWait(t, h, w, r)
+	albpool.RequireFanoutFailureDelta(t, "tsm", "", "panic", 2, func() {
+		albpool.ServeAndWait(t, h, w, r)
+	})
+	if w.Code < 500 {
+		t.Errorf("expected 5xx, got %d", w.Code)
+	}
 }

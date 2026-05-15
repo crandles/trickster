@@ -17,6 +17,7 @@
 package tsm
 
 import (
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -128,7 +129,13 @@ func (h *handler) dedupToleranceNanos() int64 {
 	if h.tsmOptions.DedupToleranceMs == nil || *h.tsmOptions.DedupToleranceMs <= 0 {
 		return 0
 	}
-	return int64(*h.tsmOptions.DedupToleranceMs) * 1_000_000
+	// Clamp at math.MaxInt64/1e6 to avoid int64 multiply overflow producing a negative window.
+	const maxMs = math.MaxInt64 / 1_000_000
+	ms := *h.tsmOptions.DedupToleranceMs
+	if ms > maxMs {
+		ms = maxMs
+	}
+	return int64(ms) * 1_000_000
 }
 
 func (h *handler) Name() types.Name {
@@ -375,6 +382,18 @@ func pickWinner(results []gatherResult) (merge.RespondFunc, http.Header) {
 // outbound code is the lowest 2xx seen (so 200 wins over 206); otherwise the
 // highest non-2xx wins so the more severe failure propagates instead of being
 // masked by an incidentally-lower error code.
+func allFanoutFailed(results []fanout.Result) bool {
+	if len(results) == 0 {
+		return false
+	}
+	for _, r := range results {
+		if !r.Failed {
+			return false
+		}
+	}
+	return true
+}
+
 func aggregateStatus(results []gatherResult) (status int, statusHeader string, has2xx, hasNon2xx bool) {
 	var min2xx, maxErr int
 	for _, res := range results {
@@ -528,6 +547,14 @@ func (h *handler) serveStandard(
 		}
 	}
 
+	// If every fanout slot failed at the dispatch level (panics, transport
+	// errors, all-clone-errors), surface 502 rather than the empty-200
+	// branch below.
+	if allFanoutFailed(fanoutResults) {
+		failures.HandleBadGateway(w, r)
+		return
+	}
+
 	// winnerHeaders carries custom response headers (e.g. those set by a
 	// pool member's path override via response_headers:) from the same
 	// member whose mergeFunc will write the final response. Without this,
@@ -578,6 +605,9 @@ func (h *handler) serveStandard(
 // (which uses Set semantics) doesn't collapse them. RFC 6265 allows multiple
 // Set-Cookie response headers; Warning (RFC 7234) is similar but no current
 // backend sets it.
+//
+// Set-Cookie is aggregated across every shard, so deploying TSM across a
+// tenant boundary will mix session cookies between tenants.
 func mergeMultiValuedHeaders(dst http.Header, results []gatherResult, winnerHeaders http.Header) {
 	for _, res := range results {
 		if res.header == nil {

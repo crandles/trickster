@@ -180,17 +180,16 @@ func SizedBodyHandler(code, size int) http.Handler {
 	})
 }
 
-// ServeAndWait runs h.ServeHTTP(w, r) in a goroutine with a deferred
-// recover (panic reported via t.Errorf) and asserts the call returns
-// within 5s.
+// ServeAndWait runs h.ServeHTTP(w, r) in a goroutine, asserts it returns
+// within 5s, and re-raises any unrecovered panic via t.Fatalf so callers
+// cannot keep asserting after a dead handler.
 func ServeAndWait(t testing.TB, h http.Handler, w http.ResponseWriter, r *http.Request) {
 	t.Helper()
 	done := make(chan struct{})
+	var rec any
 	go func() {
 		defer func() {
-			if rec := recover(); rec != nil {
-				t.Errorf("unrecovered panic in ServeHTTP goroutine: %v", rec)
-			}
+			rec = recover()
 			close(done)
 		}()
 		h.ServeHTTP(w, r)
@@ -199,6 +198,9 @@ func ServeAndWait(t testing.TB, h http.Handler, w http.ResponseWriter, r *http.R
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("ServeHTTP did not return within 5s")
+	}
+	if rec != nil {
+		t.Fatalf("unrecovered panic in ServeHTTP goroutine: %v", rec)
 	}
 }
 
