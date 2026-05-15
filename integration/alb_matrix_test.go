@@ -34,6 +34,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/trickstercache/trickster/v2/integration/internal/metricsutil"
+	"github.com/trickstercache/trickster/v2/integration/internal/portutil"
 )
 
 // TestALBMatrix crosses the ALB mechanism, pool size, fraction of pool
@@ -52,6 +53,12 @@ func TestALBMatrix(t *testing.T) {
 	}
 
 	cases := buildMatrixCases()
+	ports := portutil.Reserve(t, len(cases)*3)
+	for i := range cases {
+		cases[i].frontPort = ports[i*3]
+		cases[i].metricsPort = ports[i*3+1]
+		cases[i].mgmtPort = ports[i*3+2]
+	}
 	for _, c := range cases {
 		t.Run(c.name(), func(t *testing.T) {
 			runMatrixCell(t, c)
@@ -93,10 +100,6 @@ func buildMatrixCases() []matrixCell {
 	modes := []string{"steady", "flapping"}
 
 	var cases []matrixCell
-	// Allocate disjoint ports per cell so parallel cleanup never collides
-	// even if subtests overlap. base=24000 keeps us clear of the other ALB
-	// integration tests (which sit in the 18xxx-19xxx range).
-	port := 24000
 	for _, m := range mechs {
 		for _, p := range pools {
 			for _, d := range downs {
@@ -106,11 +109,7 @@ func buildMatrixCases() []matrixCell {
 						poolSize:     p,
 						downFraction: d,
 						mode:         mode,
-						frontPort:    port,
-						metricsPort:  port + 1,
-						mgmtPort:     port + 2,
 					})
-					port += 10
 				}
 			}
 		}

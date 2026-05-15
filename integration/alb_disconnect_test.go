@@ -240,10 +240,12 @@ func runDisconnectMidFanout(t *testing.T, mech string, frontPort, metricsPort, m
 	// to absorb late-arriving cleanup (keepalive timers, capture flushers,
 	// httptest accept-loop churn) without a hard sleep gamble.
 	const (
-		allowedDelta  = 10
-		pollDeadline  = 5 * time.Second
-		pollInterval  = 100 * time.Millisecond
-		settleFloor   = 2500 * time.Millisecond
+		// Tightened from 10: per-shard leak threshold is 3 goroutines, so 10
+		// hides a single-request regression entirely.
+		allowedDelta = 3
+		pollDeadline = 5 * time.Second
+		pollInterval = 100 * time.Millisecond
+		settleFloor  = 2500 * time.Millisecond
 	)
 	time.Sleep(settleFloor)
 

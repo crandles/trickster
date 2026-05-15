@@ -265,10 +265,13 @@ backends:
 	// ErrCacheClosed which the engine treats as a cache miss and proxies
 	// to upstream. Either path must return 2xx.
 	require.Greater(t, totalRequests, int64(100), "storm produced no requests")
-	errRate := float64(requestErrors.Load()+requestNon2xx.Load()) / float64(totalRequests)
-	require.Lessf(t, errRate, 0.05,
-		"error rate %.3f%% (errors=%d non2xx=%d / requests=%d) exceeds 5%% during reload storm",
-		errRate*100, requestErrors.Load(), requestNon2xx.Load(), totalRequests)
+	totalBad := requestErrors.Load() + requestNon2xx.Load()
+	// Spec says every request must return 2xx. A handful of edge-of-reload
+	// failures stay tolerated to keep this from flaking on slow CI, but the
+	// previous 5% rate let a per-reload regression hide entirely.
+	require.LessOrEqualf(t, totalBad, int64(5),
+		"too many failed requests during reload storm: errors=%d non2xx=%d / requests=%d",
+		requestErrors.Load(), requestNon2xx.Load(), totalRequests)
 
 	// Secondary assertion: goroutine count growth must be bounded. The
 	// drain bug we're guarding against, if reintroduced, would leave one

@@ -33,6 +33,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/trickstercache/trickster/v2/integration/internal/chaos"
+	"github.com/trickstercache/trickster/v2/integration/internal/portutil"
 )
 
 func TestALBChaosBehaviors(t *testing.T) {
@@ -55,10 +56,9 @@ func TestALBChaosBehaviors(t *testing.T) {
 			time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))},
 	}
 
-	port := 25000
-	for _, c := range cells {
-		port += 10
-		front, metrics, mgmt := port, port+1, port+2
+	ports := portutil.Reserve(t, len(cells)*3)
+	for i, c := range cells {
+		front, metrics, mgmt := ports[i*3], ports[i*3+1], ports[i*3+2]
 		t.Run(fmt.Sprintf("%s_%s", c.mech, c.behavior), func(t *testing.T) {
 			runChaosCell(t, c.mech, c.behavior, c.fn, front, metrics, mgmt)
 		})
