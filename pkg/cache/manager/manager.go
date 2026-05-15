@@ -19,7 +19,6 @@ package manager
 import (
 	"errors"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/trickstercache/trickster/v2/pkg/cache"
@@ -75,14 +74,15 @@ type Manager struct {
 	config      *options.Options
 	opts        CacheOptions
 
+	// mu serializes acquire/release vs Close. WaitGroup forbids concurrent
+	// Add and Wait, so the closing flag and Add(1) live under one lock.
+	mu sync.Mutex
 	// inflight counts active Store/Retrieve/Remove calls. Close() waits for
 	// it to reach zero before invoking the underlying client Close.
 	inflight sync.WaitGroup
-	// closing is set to 1 once Close() begins so new operations short-circuit
-	// rather than racing the teardown.
-	closing atomic.Bool
+	// closing is set once Close() begins so new operations short-circuit.
+	closing bool
 	// closeDrainTimeout bounds how long Close() waits for inflight to drain.
-	// Zero means use DefaultCloseDrainHardTimeout.
 	closeDrainTimeout time.Duration
 }
 
@@ -96,17 +96,12 @@ func (cm *Manager) SetCloseDrainTimeout(d time.Duration) {
 // acquire increments the inflight counter if the cache is not closing.
 // Returns false if Close() has already started.
 func (cm *Manager) acquire() bool {
-	if cm.closing.Load() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.closing {
 		return false
 	}
 	cm.inflight.Add(1)
-	// Re-check after the Add: if Close() flipped the flag between our load
-	// and Add, undo and bail. This pairs with the Wait in Close() which
-	// observes the flag before draining.
-	if cm.closing.Load() {
-		cm.inflight.Done()
-		return false
-	}
 	return true
 }
 
@@ -210,7 +205,10 @@ func (cm *Manager) Remove(cacheKeys ...string) error {
 // touching the underlying client. Close is safe to call once; further calls
 // no-op the drain and forward to the client.
 func (cm *Manager) Close() error {
-	first := cm.closing.CompareAndSwap(false, true)
+	cm.mu.Lock()
+	first := !cm.closing
+	cm.closing = true
+	cm.mu.Unlock()
 	if !first {
 		return cm.Client.Close()
 	}

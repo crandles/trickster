@@ -36,26 +36,22 @@ func TestSwitchHandlerConcurrentUpdateReadIsRaceFree(t *testing.T) {
 
 	const writers, readers = 8, 8
 
-	for i := 0; i < writers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range writers {
+		wg.Go(func() {
 			for !stop.Load() {
 				sh.Update(http.NewServeMux())
 			}
-		}()
+		})
 	}
 
-	for i := 0; i < readers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range readers {
+		wg.Go(func() {
 			r := httptest.NewRequest(http.MethodGet, "/", nil)
 			for !stop.Load() {
 				w := httptest.NewRecorder()
 				sh.ServeHTTP(w, r)
 			}
-		}()
+		})
 	}
 
 	time.Sleep(500 * time.Millisecond)

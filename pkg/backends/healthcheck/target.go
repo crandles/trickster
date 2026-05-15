@@ -244,7 +244,9 @@ func (t *target) probeLoop(ctx context.Context) {
 
 func (t *target) probe(ctx context.Context) {
 	r := t.baseRequest.Clone(ctx)
+	start := time.Now()
 	resp, err := t.httpClient.Do(r)
+	metrics.HealthcheckProbeLatency.WithLabelValues(t.Name()).Observe(time.Since(start).Seconds())
 	st := t.status.Get()
 	var errCnt, successCnt int
 	var passed bool

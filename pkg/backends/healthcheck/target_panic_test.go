@@ -77,8 +77,7 @@ func TestProbeLoopSurvivesPanic(t *testing.T) {
 	}, client)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	tgt.Start(ctx)
 	defer tgt.Stop()
 

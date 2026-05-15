@@ -18,6 +18,7 @@ package pool
 
 import (
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,7 +35,7 @@ func TestRepro_H1_DeadRefreshWorker(t *testing.T) {
 	const n = 3
 	targets := make(Targets, n)
 	statuses := make([]*healthcheck.Status, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		st := &healthcheck.Status{}
 		st.Set(healthcheck.StatusPassing)
 		statuses[i] = st
@@ -75,7 +76,7 @@ func TestRepro_H1b_RealPoolFlapStorm(t *testing.T) {
 	const n = 3
 	targets := make(Targets, n)
 	statuses := make([]*healthcheck.Status, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		st := &healthcheck.Status{}
 		st.Set(healthcheck.StatusPassing)
 		statuses[i] = st
@@ -96,26 +97,18 @@ func TestRepro_H1b_RealPoolFlapStorm(t *testing.T) {
 
 	statuses[0].Set(healthcheck.StatusFailing)
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 200; i++ {
+	wg.Go(func() {
+		for range 200 {
 			statuses[1].Set(healthcheck.StatusFailing)
 			statuses[1].Set(healthcheck.StatusPassing)
 		}
-	}()
+	})
 	wg.Wait()
 
 	deadline = time.Now().Add(1 * time.Second)
 	for time.Now().Before(deadline) {
 		ts := p.Targets()
-		ok := true
-		for _, tt := range ts {
-			if tt == targets[0] {
-				ok = false
-				break
-			}
-		}
+		ok := !slices.Contains(ts, targets[0])
 		if ok && len(ts) == n-1 {
 			return
 		}
@@ -130,7 +123,7 @@ func TestRepro_H2_ChannelDrop(t *testing.T) {
 	const n = 10
 	targets := make(Targets, n)
 	statuses := make([]*healthcheck.Status, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		st := &healthcheck.Status{}
 		st.Set(healthcheck.StatusPassing)
 		statuses[i] = st
@@ -150,11 +143,11 @@ func TestRepro_H2_ChannelDrop(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
+	for i := range n {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			for j := 0; j < 50; j++ {
+			for range 50 {
 				statuses[idx].Set(healthcheck.StatusFailing)
 				statuses[idx].Set(healthcheck.StatusPassing)
 			}
@@ -166,13 +159,7 @@ func TestRepro_H2_ChannelDrop(t *testing.T) {
 	deadline = time.Now().Add(1 * time.Second)
 	for time.Now().Before(deadline) {
 		ts := p.Targets()
-		hasFailing := false
-		for _, tt := range ts {
-			if tt == targets[0] {
-				hasFailing = true
-				break
-			}
-		}
+		hasFailing := slices.Contains(ts, targets[0])
 		if !hasFailing && len(ts) == n-1 {
 			return
 		}
@@ -187,7 +174,7 @@ func TestRepro_H4_ScaleRace(t *testing.T) {
 	const n = 50
 	targets := make(Targets, n)
 	statuses := make([]*healthcheck.Status, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		st := &healthcheck.Status{}
 		st.Set(healthcheck.StatusPassing)
 		statuses[i] = st
@@ -210,9 +197,7 @@ func TestRepro_H4_ScaleRace(t *testing.T) {
 	failingMask := make([]atomic.Bool, n)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for i := 0; i < n; i += 3 {
 			statuses[i].Set(healthcheck.StatusFailing)
 			failingMask[i].Store(true)
@@ -232,7 +217,7 @@ func TestRepro_H4_ScaleRace(t *testing.T) {
 				}
 			}
 		}
-	}()
+	})
 
 	time.Sleep(50 * time.Millisecond)
 

@@ -44,6 +44,18 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// perSlotReserveBytes returns the worst-case per-slot capture reservation
+// matching PrepareClone's effective per-writer cap. Keeping these in sync
+// is required for the aggregate-cap admission to bound actual in-flight
+// memory; otherwise a zero MaxCaptureBytes silently disables admission while
+// each writer still allocates up to capture.DefaultMaxBytes.
+func perSlotReserveBytes(cfg Config) int64 {
+	if cfg.MaxCaptureBytes > 0 {
+		return int64(cfg.MaxCaptureBytes)
+	}
+	return int64(capture.DefaultMaxBytes)
+}
+
 // reasonRoutingFlap labels a failure where the target was healthy at
 // LiveTargets snapshot time but had flipped to Failing by the time the
 // fanout goroutine observed its response. Operators alerting on
@@ -111,10 +123,14 @@ type Config struct {
 	MaxCaptureBytes int
 	// MaxFanoutCaptureBytes, if > 0, caps the aggregate in-flight
 	// capture-buffer reservations across all slots in one fanout call. Each
-	// slot reserves cfg.MaxCaptureBytes (the per-slot worst case). Slots
-	// dispatched after the budget would go negative are fail-fasted with
-	// Failed=true and Capture=nil before the handler runs. Defaults to 0
-	// (no aggregate cap).
+	// slot reserves the effective per-writer cap (cfg.MaxCaptureBytes, or
+	// capture.DefaultMaxBytes when zero) as its worst case. Slots dispatched
+	// after the budget would go negative are fail-fasted with Failed=true
+	// and Capture=nil before the handler runs. Combined with the per-writer
+	// hard cap inside capture.CaptureResponseWriter.Write, this bounds
+	// aggregate in-flight capture memory at MaxFanoutCaptureBytes even when
+	// upstreams return more bytes than declared by Content-Length. Defaults
+	// to 0 (no aggregate cap).
 	MaxFanoutCaptureBytes int
 	// Resources, if non-nil, returns the Resources to attach to each
 	// cloned request before the member's handler sees it. Nil resources
@@ -231,7 +247,7 @@ func scatter(ctx context.Context, parent *http.Request, targets pool.Targets, cf
 	if aggregateCap {
 		budget.Store(int64(cfg.MaxFanoutCaptureBytes))
 	}
-	perSlotReserve := int64(cfg.MaxCaptureBytes)
+	perSlotReserve := perSlotReserveBytes(cfg)
 
 	for i := range l {
 		if targets[i] == nil {

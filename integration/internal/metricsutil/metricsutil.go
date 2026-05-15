@@ -73,7 +73,7 @@ func ScrapeURL(t testing.TB, url string, cli *http.Client) map[string]float64 {
 		cli = scrapeClient
 	}
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := range 3 {
 		resp, err := cli.Get(url)
 		if err != nil {
 			lastErr = err

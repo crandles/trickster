@@ -314,6 +314,17 @@ func (idx *IndexedClient) Close() error {
 // flusher periodically calls the cache's index flush func that writes the cache index to disk
 func (idx *IndexedClient) flusher(ctx context.Context) {
 	defer idx.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("cache index flusher panic", logging.Pairs{
+				"cacheName": idx.name,
+				"worker":    "flusher",
+				"panic":     r,
+			})
+			gm.CacheIndexPanicRecovered.WithLabelValues("flusher").Inc()
+			idx.flusherExited.Store(true)
+		}
+	}()
 FLUSHER:
 	for {
 		fi := idx.options.Load().(*options.Options).FlushInterval
@@ -367,6 +378,17 @@ func (idx *IndexedClient) flushOnce() {
 // reaper continually iterates through the cache to find expired elements and removes them
 func (idx *IndexedClient) reaper(ctx context.Context) {
 	defer idx.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("cache index reaper panic", logging.Pairs{
+				"cacheName": idx.name,
+				"worker":    "reaper",
+				"panic":     r,
+			})
+			gm.CacheIndexPanicRecovered.WithLabelValues("reaper").Inc()
+			idx.reaperExited.Store(true)
+		}
+	}()
 REAPER:
 	for {
 		ri := idx.options.Load().(*options.Options).ReapInterval

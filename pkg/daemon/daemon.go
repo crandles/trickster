@@ -28,6 +28,7 @@ import (
 
 	"github.com/trickstercache/trickster/v2/pkg/appinfo"
 	"github.com/trickstercache/trickster/v2/pkg/appinfo/usage"
+	"github.com/trickstercache/trickster/v2/pkg/backends"
 	"github.com/trickstercache/trickster/v2/pkg/config/reload"
 	"github.com/trickstercache/trickster/v2/pkg/config/validate"
 	"github.com/trickstercache/trickster/v2/pkg/daemon/instance"
@@ -216,6 +217,21 @@ func Hup(si *instance.ServerInstance, source string, args ...string) (bool, erro
 					logging.Pairs{"error": err.Error(), "source": source})
 			}
 		}()
+	}
+
+	if oldClients != nil {
+		// close idle now, then again after drain so conns released by
+		// in-flight requests post-rotation also get reaped before the
+		// per-transport IdleConnTimeout (default 2m) elapses.
+		oldClients.CloseIdleConnections()
+		drainTimeout := 30 * time.Second
+		if newConf.MgmtConfig != nil && newConf.MgmtConfig.ReloadDrainTimeout > 0 {
+			drainTimeout = newConf.MgmtConfig.ReloadDrainTimeout
+		}
+		go func(b backends.Backends, d time.Duration) {
+			time.Sleep(d)
+			b.CloseIdleConnections()
+		}(oldClients, drainTimeout)
 	}
 
 	metrics.ReloadSuccessesTotal.Inc()

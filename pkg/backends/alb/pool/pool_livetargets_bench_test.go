@@ -27,7 +27,7 @@ import (
 func BenchmarkLiveTargets(b *testing.B) {
 	const n = 50
 	targets := make(Targets, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		st := &healthcheck.Status{}
 		st.Set(healthcheck.StatusPassing)
 		targets[i] = NewTarget(http.NotFoundHandler(), st, nil)

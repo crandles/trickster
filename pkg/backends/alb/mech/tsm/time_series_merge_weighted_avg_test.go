@@ -103,9 +103,7 @@ func TestPruneUnpairedWeightedAvgSeries(t *testing.T) {
 		sumDS := mkSumDS()
 		stop := make(chan struct{})
 		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				select {
 				case <-stop:
@@ -116,9 +114,9 @@ func TestPruneUnpairedWeightedAvgSeries(t *testing.T) {
 				sumDS.Warnings = append(sumDS.Warnings, "concurrent")
 				sumDS.UpdateLock.Unlock()
 			}
-		}()
+		})
 
-		for i := 0; i < 500; i++ {
+		for range 500 {
 			fresh := mkSumDS()
 			sumDS.UpdateLock.Lock()
 			sumDS.Results[0].SeriesList = fresh.Results[0].SeriesList

@@ -324,6 +324,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// correctly, and degraded N-pools where N-1 are unhealthy now return the
 	// surviving member's response directly instead of 502'ing on a one-shard
 	// merge that has no peer to dedup or cross-merge against.
+	// dual-query still needs merge even for one healthy target; one-shard fast path requires all three conditions
 	if l == 1 && len(stripKeys) == 0 && !needsDualQuery {
 		defaultHandler.ServeHTTP(w, r)
 		return

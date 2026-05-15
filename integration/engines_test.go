@@ -157,7 +157,7 @@ func TestEngines_PCF_Collapse(t *testing.T) {
 	results := make(chan result, n)
 	var wg sync.WaitGroup
 	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			defer wg.Done()
 			sc, b, _ := doEngineRange(t, params)
@@ -197,7 +197,7 @@ func TestEngines_Singleflight_ErrorPropagation(t *testing.T) {
 	results := make(chan result, n)
 	var wg sync.WaitGroup
 	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			defer wg.Done()
 			sc, b, _ := doEngineRange(t, params)
@@ -238,7 +238,7 @@ func TestEngines_Collapse_MetricsReport(t *testing.T) {
 	const n = 20
 	var wg sync.WaitGroup
 	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			defer wg.Done()
 			sc, _, _ := doEngineRange(t, params)
@@ -324,7 +324,7 @@ func readProxyHitCount(t *testing.T) float64 {
 	b, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	var total float64
-	for _, line := range strings.Split(string(b), "\n") {
+	for line := range strings.SplitSeq(string(b), "\n") {
 		if line == "" || line[0] == '#' {
 			continue
 		}

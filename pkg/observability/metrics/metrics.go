@@ -382,6 +382,21 @@ var (
 		[]string{"target"},
 	)
 
+	// HealthcheckProbeLatency records wall-clock duration of each per-target
+	// health probe (both successful and failing). Lets ALB routing dashboards
+	// distinguish a slow-but-healthy backend from a fast-and-healthy one;
+	// without this, only binary healthy/unhealthy state is visible.
+	HealthcheckProbeLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricNamespace,
+			Subsystem: healthSubsystem,
+			Name:      "probe_latency_seconds",
+			Help:      "Latency of per-target health-check probes, in seconds, by target.",
+			Buckets:   []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+		},
+		[]string{"target"},
+	)
+
 	// ProxyEnginesPanicRecovered counts recovered panics in fire-and-forget
 	// goroutines spawned by the proxy/engines layer (DPC cache.Remove, upstream
 	// access-log emission, PCF io.Copy pumps). A panic in any of these would
@@ -395,6 +410,48 @@ var (
 			Help:      "Count of recovered panics in proxy/engines fire-and-forget goroutines, by call site.",
 		},
 		[]string{"site"},
+	)
+
+	// CacheIndexPanicRecovered counts recovered panics in the cache index
+	// flusher and reaper goroutines. Without recovery, a panicking flusher
+	// leaves the on-disk index stale (cold-start drops the cache); a panicking
+	// reaper lets expired entries accumulate until the cache outgrows its
+	// configured ceiling. The worker label distinguishes flusher from reaper.
+	CacheIndexPanicRecovered = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: cacheSubsystem,
+			Name:      "index_panic_recovered_total",
+			Help:      "Count of recovered panics in cache index worker goroutines, by worker.",
+		},
+		[]string{"worker"},
+	)
+
+	// HealthHandlerPanicRecovered counts recovered panics in the status-page
+	// builder goroutine spawned by the /trickster/health handler. A panic in
+	// the builder would freeze the status page at its last rendered text;
+	// recovery keeps the handler serving updated state.
+	HealthHandlerPanicRecovered = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: healthSubsystem,
+			Name:      "handler_panic_recovered_total",
+			Help:      "Count of recovered panics in the health status-page builder goroutine.",
+		},
+	)
+
+	// HealthcheckStatusNotifyPanicRecovered counts recovered panics while
+	// notifying a Status subscriber (e.g. a closed channel send). The per-
+	// subscriber recover ensures a single bad subscriber cannot kill the probe
+	// loop or block notifying the remaining subscribers.
+	HealthcheckStatusNotifyPanicRecovered = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricNamespace,
+			Subsystem: healthSubsystem,
+			Name:      "status_notify_panic_recovered_total",
+			Help:      "Count of recovered panics while notifying a healthcheck Status subscriber, by target.",
+		},
+		[]string{"target"},
 	)
 )
 
@@ -416,7 +473,11 @@ func init() {
 	prometheus.MustRegister(ALBFanoutAttempts)
 	prometheus.MustRegister(ALBPoolRefreshPanicRecovered)
 	prometheus.MustRegister(HealthcheckProbePanicRecovered)
+	prometheus.MustRegister(HealthcheckProbeLatency)
 	prometheus.MustRegister(ProxyEnginesPanicRecovered)
+	prometheus.MustRegister(CacheIndexPanicRecovered)
+	prometheus.MustRegister(HealthHandlerPanicRecovered)
+	prometheus.MustRegister(HealthcheckStatusNotifyPanicRecovered)
 	prometheus.MustRegister(CacheObjectOperations)
 	prometheus.MustRegister(CacheByteOperations)
 	prometheus.MustRegister(CacheEvents)

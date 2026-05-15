@@ -1,6 +1,6 @@
 module github.com/trickstercache/trickster/v2/integration
 
-go 1.26.2
+go 1.26.3
 
 replace github.com/trickstercache/trickster/v2 => ../
 

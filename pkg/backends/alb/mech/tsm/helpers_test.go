@@ -68,7 +68,6 @@ func TestPickWinner(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			called := map[string]bool{}
 			mk := func(name string) merge.RespondFunc {
@@ -166,7 +165,6 @@ func TestAggregateStatus(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			code, sh, has2xx, hasNon2xx := aggregateStatus(tc.results)
 			if code != tc.wantCode {
@@ -215,7 +213,6 @@ func TestMergeMultiValuedHeaders(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			dst := http.Header{}
 			mergeMultiValuedHeaders(dst, tc.results, tc.winner)

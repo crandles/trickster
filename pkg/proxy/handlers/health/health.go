@@ -36,6 +36,9 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/names"
 	"github.com/trickstercache/trickster/v2/pkg/backends/healthcheck"
 	"github.com/trickstercache/trickster/v2/pkg/backends/providers"
+	"github.com/trickstercache/trickster/v2/pkg/observability/logging"
+	"github.com/trickstercache/trickster/v2/pkg/observability/logging/logger"
+	"github.com/trickstercache/trickster/v2/pkg/observability/metrics"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/contenttype"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/headers"
 	"github.com/trickstercache/trickster/v2/pkg/util/sets"
@@ -160,8 +163,22 @@ func StatusHandler(now func() time.Time, hc healthcheck.HealthChecker, backends 
 	if now == nil {
 		now = time.Now
 	}
-	go builder(now, hc, hd, backends, ready) // listens for rebuild notifications and updates the texts
-	<-ready                                  // wait for the builder to be ready before returning the handler
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("health status builder panic", logging.Pairs{
+					"panic": r,
+				})
+				metrics.HealthHandlerPanicRecovered.Inc()
+				select {
+				case ready <- true:
+				default:
+				}
+			}
+		}()
+		builder(now, hc, hd, backends, ready)
+	}()
+	<-ready // wait for the builder to be ready before returning the handler
 
 	// the handler, when requested, simply prints out the static text stored in the healthDetail
 	// which is being updated in real time by the builder.

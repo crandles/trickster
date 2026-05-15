@@ -38,7 +38,7 @@ func (b *stripKeysStubBackend) Configuration() *bo.Options { return b.cfg }
 func newStripKeysTargets(tb testing.TB, n int) pool.Targets {
 	tb.Helper()
 	targets := make(pool.Targets, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		labels := map[string]string{
 			fmt.Sprintf("region_%d", i): fmt.Sprintf("us-east-%d", i),
 			fmt.Sprintf("zone_%d", i):   fmt.Sprintf("az-%d", i),

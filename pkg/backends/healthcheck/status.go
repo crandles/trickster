@@ -26,6 +26,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/trickstercache/trickster/v2/pkg/observability/logging"
+	"github.com/trickstercache/trickster/v2/pkg/observability/logging/logger"
+	"github.com/trickstercache/trickster/v2/pkg/observability/metrics"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/headers"
 )
 
@@ -98,10 +101,26 @@ func (s *Status) Set(i int32) {
 	subs := slices.Clone(s.subscribers)
 	s.mtx.Unlock()
 	for _, ch := range subs {
-		select {
-		case ch <- true:
-		default:
+		s.notifySubscriber(ch)
+	}
+}
+
+// notifySubscriber sends a non-blocking notification to ch. Each send is
+// isolated by recover so a closed-channel panic on one subscriber does not
+// stop notifying the rest or propagate up to the probe loop caller.
+func (s *Status) notifySubscriber(ch chan bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("healthcheck status notify panic", logging.Pairs{
+				"target": s.name,
+				"panic":  fmt.Sprintf("%v", r),
+			})
+			metrics.HealthcheckStatusNotifyPanicRecovered.WithLabelValues(s.name).Inc()
 		}
+	}()
+	select {
+	case ch <- true:
+	default:
 	}
 }
 

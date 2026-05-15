@@ -96,6 +96,9 @@ func NewHTTPClient(o *bo.Options) (*http.Client, error) {
 			ExpectContinueTimeout: o.Timeout,
 			ResponseHeaderTimeout: o.Timeout,
 			TLSClientConfig:       TLSConfig,
+			// pin upstream to HTTP/1.1: GOAWAY/stream-reset semantics on h2 are not exercised by trickster's fanout paths
+			ForceAttemptHTTP2: false,
+			TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
 		},
 	}
 

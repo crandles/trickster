@@ -52,8 +52,10 @@ import (
 // Secondary assertion: bounded goroutine growth. The drain bug, if
 // reintroduced, would leave one goroutine per in-flight op stuck on a
 // closed client (thousands under this storm). With the cache-rename
-// close fix in applyCachingConfig, steady-state is ~3 goroutines/reload
-// from transient persistConns; 10/reload here is snug-but-not-flaky.
+// close fix in applyCachingConfig and CloseIdleConnections on old
+// backends in Hup, observed delta is ~0-3 goroutines across 12 reloads;
+// 1/reload here is tight enough to catch a single-goroutine-per-reload
+// regression.
 func TestReloadStormDoesNotLeak(t *testing.T) {
 	if testing.Short() {
 		t.Skip("storm test takes 15-30s; skipped under -short")
@@ -180,10 +182,8 @@ backends:
 		IdleConnTimeout:     30 * time.Second,
 	}
 	defer sharedTransport.CloseIdleConnections()
-	for i := 0; i < workers; i++ {
-		workerWG.Add(1)
-		go func() {
-			defer workerWG.Done()
+	for range workers {
+		workerWG.Go(func() {
 			client := &http.Client{Timeout: 5 * time.Second, Transport: sharedTransport}
 			for {
 				select {
@@ -203,15 +203,13 @@ backends:
 					requestNon2xx.Add(1)
 				}
 			}
-		}()
+		})
 	}
 
 	// Reload loop: alternate cache name and fire mgmt reloads at intervals.
 	reloadInterval := stormDuration / time.Duration(reloadCount+1)
 	var reloadWG sync.WaitGroup
-	reloadWG.Add(1)
-	go func() {
-		defer reloadWG.Done()
+	reloadWG.Go(func() {
 		ticker := time.NewTicker(reloadInterval)
 		defer ticker.Stop()
 		current := "memA"
@@ -246,7 +244,7 @@ backends:
 			}
 			fired++
 		}
-	}()
+	})
 	reloadWG.Wait()
 
 	// Let workers run a bit longer post-final-reload so any racey in-flight
@@ -276,9 +274,9 @@ backends:
 	// drain bug we're guarding against, if reintroduced, would leave one
 	// goroutine per in-flight cache op stuck on a closed client -- under
 	// this storm that would be hundreds-of-thousands of goroutines. The
-	// per-reload cap is snug (10/reload, observed steady-state ~3/reload)
-	// so a regression that adds even a single goroutine-per-reload leak
-	// surfaces here.
+	// per-reload cap is tight (1/reload, observed delta ~0-3 across all
+	// reloads) so a regression that adds even a single
+	// goroutine-per-reload leak surfaces here.
 	//
 	// Close idle keep-alive conns in the worker transport before sampling
 	// so the storm's persistConn read/write loops exit. Otherwise idle
@@ -288,7 +286,7 @@ backends:
 		goruntime.GC()
 		goruntime.GC()
 		got := goruntime.NumGoroutine()
-		maxAllowed := baselineGoroutines + 10*reloadCount
+		maxAllowed := baselineGoroutines + 1*reloadCount
 		assert.LessOrEqualf(collect, got, maxAllowed,
 			"goroutine count grew beyond bound: baseline=%d got=%d max=%d (reloads=%d)",
 			baselineGoroutines, got, maxAllowed, reloadCount)

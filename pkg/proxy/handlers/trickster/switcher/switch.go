@@ -45,6 +45,7 @@ func (s *SwitchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Update atomically changes the underlying handler without impacting user requests or uptime
 func (s *SwitchHandler) Update(h http.Handler) {
+	// swap is non-blocking by design; do not add an in-flight drain here, it reintroduces the deadlock the atomic.Pointer fixed
 	s.router.Store(&h)
 }
 

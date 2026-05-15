@@ -53,7 +53,6 @@ func TestALBMatrix(t *testing.T) {
 
 	cases := buildMatrixCases()
 	for _, c := range cases {
-		c := c
 		t.Run(c.name(), func(t *testing.T) {
 			runMatrixCell(t, c)
 		})
@@ -76,10 +75,7 @@ func (c matrixCell) name() string {
 }
 
 func (c matrixCell) downCount() int {
-	n := int(float64(c.poolSize)*c.downFraction + 0.5)
-	if n > c.poolSize {
-		n = c.poolSize
-	}
+	n := min(int(float64(c.poolSize)*c.downFraction+0.5), c.poolSize)
 	// Guarantee at least one healthy member for any fraction strictly
 	// less than 1.0; otherwise rounding (e.g. 5 * 0.9 = 4.5 -> 5) can
 	// collapse a "mostly down" cell into all-down and re-classify the
@@ -234,7 +230,7 @@ func runMatrixCell(t *testing.T, c matrixCell) {
 				case <-flipCtx.Done():
 					return
 				case <-tk.C:
-					for i := 0; i < down; i++ {
+					for i := range down {
 						stubs[i].setUp(!stubs[i].up.Load())
 					}
 				}

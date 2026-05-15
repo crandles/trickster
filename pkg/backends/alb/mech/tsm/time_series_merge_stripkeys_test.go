@@ -100,18 +100,16 @@ func TestComputeStripKeysConcurrent(t *testing.T) {
 		mkStripKeysTarget(map[string]string{"cluster": "c1"}),
 	}
 	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 64; j++ {
+	for range 32 {
+		wg.Go(func() {
+			for range 64 {
 				keys := h.computeStripKeys(targets)
 				if len(keys) != 3 {
 					t.Errorf("expected 3 keys, got %d: %v", len(keys), keys)
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }
