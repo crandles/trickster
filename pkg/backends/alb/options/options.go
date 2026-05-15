@@ -250,10 +250,7 @@ func ValidateNoCycles(albs map[string]*Options) error {
 		case visiting:
 			// back edge: cycle detected; render the cycle for the operator.
 			// slices.Index can return -1 if state is corrupt; clamp to 0.
-			start := slices.Index(path, name)
-			if start < 0 {
-				start = 0
-			}
+			start := max(slices.Index(path, name), 0)
 			cyc := append(slices.Clone(path[start:]), name)
 			return fmt.Errorf("cycle detected in alb pool references: %s "+
 				"(previously caused stack overflow at request time; "+

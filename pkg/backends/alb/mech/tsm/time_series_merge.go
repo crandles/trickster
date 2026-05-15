@@ -131,10 +131,7 @@ func (h *handler) dedupToleranceNanos() int64 {
 	}
 	// Clamp at math.MaxInt64/1e6 to avoid int64 multiply overflow producing a negative window.
 	const maxMs = math.MaxInt64 / 1_000_000
-	ms := *h.tsmOptions.DedupToleranceMs
-	if ms > maxMs {
-		ms = maxMs
-	}
+	ms := min(*h.tsmOptions.DedupToleranceMs, maxMs)
 	return int64(ms) * 1_000_000
 }
 

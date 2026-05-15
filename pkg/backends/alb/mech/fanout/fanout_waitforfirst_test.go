@@ -71,7 +71,11 @@ func TestWaitForFirstMatchingWinsAndCancelsLosers(t *testing.T) {
 	require.NotNil(t, results[1].Capture)
 	require.Equal(t, "winner", string(results[1].Capture.Body()))
 	require.Less(t, elapsed, slow, "WaitForFirst must not wait for slow losers")
-	require.Equal(t, int32(2), slowCancelled.Load(), "both slow slots must observe ctx cancel")
+	// WaitForFirst returns on winner-claim without draining losers, so the
+	// loser goroutines observe ctx cancel asynchronously after return.
+	require.Eventuallyf(t, func() bool { return slowCancelled.Load() == 2 },
+		slow, 5*time.Millisecond,
+		"both slow slots must observe ctx cancel (got %d)", slowCancelled.Load())
 }
 
 // TestWaitForFirstReturnsBeforeLoserDrains asserts that a winner is returned

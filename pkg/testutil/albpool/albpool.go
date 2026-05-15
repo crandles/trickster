@@ -319,11 +319,9 @@ func RunHealthFlipRace(
 	stop := make(chan struct{})
 	var flipperIters, fanoutIters, succeededSlots atomic.Int64
 	var wg sync.WaitGroup
-	wg.Add(2)
 
-	go func() {
-		defer wg.Done()
-		toggle := int32(healthcheck.StatusFailing)
+	wg.Go(func() {
+		toggle := healthcheck.StatusFailing
 		for {
 			select {
 			case <-stop:
@@ -342,10 +340,9 @@ func RunHealthFlipRace(
 			}
 			flipperIters.Add(1)
 		}
-	}()
+	})
 
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for {
 			select {
 			case <-stop:
@@ -355,7 +352,7 @@ func RunHealthFlipRace(
 			succeededSlots.Add(int64(fanoutFn()))
 			fanoutIters.Add(1)
 		}
-	}()
+	})
 
 	timer := time.NewTimer(deadline)
 	defer timer.Stop()

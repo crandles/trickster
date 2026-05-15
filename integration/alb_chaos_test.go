@@ -57,9 +57,10 @@ func TestALBChaosBehaviors(t *testing.T) {
 			time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))},
 	}
 
-	ports := portutil.Reserve(t, len(cells)*3)
-	for i, c := range cells {
-		front, metrics, mgmt := ports[i*3], ports[i*3+1], ports[i*3+2]
+	for _, c := range cells {
+		// Reserve per-cell to bound the close-to-bind race window.
+		ports := portutil.Reserve(t, 3)
+		front, metrics, mgmt := ports[0], ports[1], ports[2]
 		t.Run(fmt.Sprintf("%s_%s", c.mech, c.behavior), func(t *testing.T) {
 			runChaosCell(t, c.mech, c.behavior, c.fn, front, metrics, mgmt)
 		})

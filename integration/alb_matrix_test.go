@@ -54,13 +54,13 @@ func TestALBMatrix(t *testing.T) {
 	}
 
 	cases := buildMatrixCases()
-	ports := portutil.Reserve(t, len(cases)*3)
-	for i := range cases {
-		cases[i].frontPort = ports[i*3]
-		cases[i].metricsPort = ports[i*3+1]
-		cases[i].mgmtPort = ports[i*3+2]
-	}
 	for _, c := range cases {
+		// Reserve per-cell so the close-to-bind race window is bounded to
+		// one cell's setup rather than the full matrix duration. CI sees
+		// EADDRINUSE if 200+ closed ephemeral ports are held idle while
+		// other processes recycle them.
+		ports := portutil.Reserve(t, 3)
+		c.frontPort, c.metricsPort, c.mgmtPort = ports[0], ports[1], ports[2]
 		t.Run(c.name(), func(t *testing.T) {
 			runMatrixCell(t, c)
 		})
