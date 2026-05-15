@@ -149,10 +149,18 @@ func DoProxy(w io.Writer, r *http.Request, closeResponse bool) *http.Response {
 
 // PrepareResponseWriter prepares a response and returns a destination io.Writer for the payload
 // Used in Respond.
+//
+// Hop-by-hop headers named in the upstream's Connection header (and the static
+// HopHeaders set) are stripped from the downstream response before write, per
+// RFC 7230 6.1. Without this, an upstream that emitted
+// `Connection: X-Internal-Auth` plus `X-Internal-Auth: ...` would leak the
+// hop-only header to the client. Mirrors the request-side strip applied by
+// PrepareFetchReader via headers.StripClientHeaders.
 func PrepareResponseWriter(w io.Writer, code int, header http.Header) io.Writer {
 	if rw, ok := w.(http.ResponseWriter); ok {
 		h := rw.Header()
 		headers.Merge(h, header)
+		headers.StripClientHeaders(h)
 		headers.AddResponseHeaders(h)
 		if code > 0 {
 			rw.WriteHeader(code)

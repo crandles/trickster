@@ -74,6 +74,15 @@ func FuzzUserRouterCredentials(f *testing.F) {
 		},
 	}
 
+	// any status outside this set means the router either misclassified an
+	// auth failure as success or invented a new code path; either is a
+	// regression.
+	validStatuses := map[int]struct{}{
+		http.StatusOK:          {},
+		http.StatusUnauthorized: {},
+		http.StatusBadGateway:  {},
+	}
+
 	f.Fuzz(func(t *testing.T, raw string) {
 		r, rerr := http.NewRequest("GET", "http://example.com/", nil)
 		if rerr != nil {
@@ -86,8 +95,25 @@ func FuzzUserRouterCredentials(f *testing.F) {
 		}
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
-		if w.Result() == nil {
-			t.Fatal("nil response from ServeHTTP")
+		resp := w.Result()
+		if _, ok := validStatuses[resp.StatusCode]; !ok {
+			t.Fatalf("unexpected status %d for Authorization=%q", resp.StatusCode, raw)
+		}
+		// CRLF / NUL from the input must never escape into response headers.
+		// This is the response-side guard the seed corpus
+		// ("alice:secret\r\nX-Evil: 1", "alice\n:secret", NULs) is built to
+		// exercise; a regression that echoed any part of the input into a
+		// header name or value (e.g. via a router-emitted WWW-Authenticate)
+		// would be visible as a CR/LF/NUL in the captured header map.
+		for hk, hv := range resp.Header {
+			if strings.ContainsAny(hk, "\r\n\x00") {
+				t.Fatalf("CR/LF/NUL in response header name %q (input %q)", hk, raw)
+			}
+			for _, v := range hv {
+				if strings.ContainsAny(v, "\r\n\x00") {
+					t.Fatalf("CR/LF/NUL in response header %s=%q (input %q)", hk, v, raw)
+				}
+			}
 		}
 	})
 }

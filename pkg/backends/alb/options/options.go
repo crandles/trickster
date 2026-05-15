@@ -227,14 +227,16 @@ func (o *Options) ValidatePool(backendName string, allBackends sets.Set[string])
 	return nil
 }
 
-// ValidateNoCycles walks the ALB pool reference graph and returns an error if
-// any ALB pool transitively references itself. The input maps ALB-backend
-// name to its Options; non-ALB pool members are leaves and ignored. A back
-// edge to a node currently on the DFS stack is reported as a cycle.
+// ValidateNoCycles walks the ALB reference graph and returns an error if any
+// ALB transitively references itself. The input maps ALB-backend name to its
+// Options; non-ALB targets are leaves and ignored. A back edge to a node
+// currently on the DFS stack is reported as a cycle.
 //
-// Without this check, mutual references (A targets B targets A) load cleanly
-// and pass health-probe aggregation, but the first real request recurses
-// forever, OOMs the stack, or stalls until the request context expires.
+// Edges considered: (a) every entry of o.Pool, and (b) for ALBs configured
+// with the user_router mechanism, o.UserRouter.DefaultBackend plus every
+// o.UserRouter.Users[*].ToBackend. Without the user_router edges, a config
+// like alb1.mechanism=user_router with user_router.default_backend=alb1
+// passes validation and exhausts the goroutine stack on the first request.
 func ValidateNoCycles(albs map[string]*Options) error {
 	const (
 		unseen   = 0
@@ -261,7 +263,7 @@ func ValidateNoCycles(albs map[string]*Options) error {
 		}
 		state[name] = visiting
 		path = append(path, name)
-		for _, target := range o.Pool {
+		for _, target := range albEdges(o) {
 			if _, isALB := albs[target]; !isALB {
 				continue
 			}
@@ -278,6 +280,25 @@ func ValidateNoCycles(albs map[string]*Options) error {
 		}
 	}
 	return nil
+}
+
+// albEdges returns every backend name this ALB can dispatch to. For pool-
+// based mechanisms this is just o.Pool; for user_router-typed ALBs it also
+// includes UserRouter.DefaultBackend and every Users[*].ToBackend.
+func albEdges(o *Options) []string {
+	edges := make([]string, 0, len(o.Pool))
+	edges = append(edges, o.Pool...)
+	if o.UserRouter != nil {
+		if o.UserRouter.DefaultBackend != "" {
+			edges = append(edges, o.UserRouter.DefaultBackend)
+		}
+		for _, u := range o.UserRouter.Users {
+			if u != nil && u.ToBackend != "" {
+				edges = append(edges, u.ToBackend)
+			}
+		}
+	}
+	return edges
 }
 
 func (o *Options) UnmarshalYAML(unmarshal func(any) error) error {

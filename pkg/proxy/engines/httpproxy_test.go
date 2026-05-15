@@ -372,6 +372,77 @@ func TestPrepareResponseWriterPlainWriter(t *testing.T) {
 	}
 }
 
+// TestPrepareResponseWriterStripsHopByHop pins the response-side hop-by-hop
+// strip. An upstream that emits `Connection: X-Internal-Auth` plus
+// `X-Internal-Auth: <secret>` must not leak X-Internal-Auth to the client,
+// per RFC 7230 6.1. The static HopHeaders set (Connection, Keep-Alive,
+// Proxy-Authenticate, Proxy-Authorization, Te, Trailer, Transfer-Encoding,
+// Upgrade) must also be stripped.
+func TestPrepareResponseWriterStripsHopByHop(t *testing.T) {
+	tests := []struct {
+		name     string
+		upstream http.Header
+		mustGo   []string // headers that must NOT appear downstream
+		mustKeep []string // headers that MUST appear downstream
+	}{
+		{
+			name: "named in Connection: custom token stripped",
+			upstream: http.Header{
+				"Connection":      {"X-Internal-Auth"},
+				"X-Internal-Auth": {"leaked-token"},
+				"X-Safe":          {"keep"},
+			},
+			mustGo:   []string{"X-Internal-Auth", "Connection"},
+			mustKeep: []string{"X-Safe"},
+		},
+		{
+			name: "empty token then Authorization (CVE-2021-33197 shape)",
+			upstream: http.Header{
+				"Connection":    {", Authorization"},
+				"Authorization": {"Bearer leaked"},
+				"Content-Type":  {"text/plain"},
+			},
+			mustGo:   []string{"Authorization", "Connection"},
+			mustKeep: []string{"Content-Type"},
+		},
+		{
+			name: "static hop-by-hop list always stripped",
+			upstream: http.Header{
+				"Keep-Alive":          {"timeout=5"},
+				"Proxy-Authenticate":  {"Basic realm=upstream"},
+				"Proxy-Authorization": {"Basic abc"},
+				"Te":                  {"trailers"},
+				"Trailer":             {"Expires"},
+				"Transfer-Encoding":   {"chunked"},
+				"Upgrade":             {"websocket"},
+				"Content-Type":        {"application/json"},
+			},
+			mustGo: []string{
+				"Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
+				"Te", "Trailer", "Transfer-Encoding", "Upgrade",
+			},
+			mustKeep: []string{"Content-Type"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			PrepareResponseWriter(w, http.StatusOK, tc.upstream)
+			got := w.Header()
+			for _, h := range tc.mustGo {
+				if vals := got.Values(h); len(vals) > 0 {
+					t.Errorf("header %q must not be forwarded to client, got %v", h, vals)
+				}
+			}
+			for _, h := range tc.mustKeep {
+				if got.Get(h) == "" {
+					t.Errorf("header %q must be forwarded to client, missing", h)
+				}
+			}
+		})
+	}
+}
+
 func TestSetStatusHeader(t *testing.T) {
 	tests := []struct {
 		httpStatus     int

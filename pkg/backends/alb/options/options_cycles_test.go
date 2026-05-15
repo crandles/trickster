@@ -19,6 +19,8 @@ package options
 import (
 	"strings"
 	"testing"
+
+	ur "github.com/trickstercache/trickster/v2/pkg/backends/alb/mech/ur/options"
 )
 
 func TestValidateNoCycles(t *testing.T) {
@@ -116,6 +118,96 @@ func TestValidateNoCycles(t *testing.T) {
 			albs: map[string]*Options{
 				"alb_root": {Pool: []string{"prom_a", "alb_mid", "prom_b"}},
 				"alb_mid":  {Pool: []string{"prom_c"}},
+			},
+			wantErr: false,
+		},
+		{
+			name: "user_router self-loop via default_backend",
+			albs: map[string]*Options{
+				"alb1": {
+					MechanismName: "user_router",
+					UserRouter:    &ur.Options{DefaultBackend: "alb1"},
+				},
+			},
+			wantErr: true,
+			errSub:  "cycle",
+		},
+		{
+			name: "user_router 2-cycle via default_backend",
+			albs: map[string]*Options{
+				"alb_a": {
+					MechanismName: "user_router",
+					UserRouter:    &ur.Options{DefaultBackend: "alb_b"},
+				},
+				"alb_b": {
+					MechanismName: "user_router",
+					UserRouter:    &ur.Options{DefaultBackend: "alb_a"},
+				},
+			},
+			wantErr: true,
+			errSub:  "cycle",
+		},
+		{
+			name: "user_router cycle via Users[].to_backend",
+			albs: map[string]*Options{
+				"alb1": {
+					MechanismName: "user_router",
+					UserRouter: &ur.Options{
+						DefaultBackend: "prom1",
+						Users: ur.UserMappingOptionsByUser{
+							"alice": {ToBackend: "alb1"},
+						},
+					},
+				},
+			},
+			wantErr: true,
+			errSub:  "cycle",
+		},
+		{
+			name: "user_router mixed pool+UR cycle: rr alb_root -> ur alb_ur -> alb_root",
+			albs: map[string]*Options{
+				"alb_root": {Pool: []string{"alb_ur"}},
+				"alb_ur": {
+					MechanismName: "user_router",
+					UserRouter:    &ur.Options{DefaultBackend: "alb_root"},
+				},
+			},
+			wantErr: true,
+			errSub:  "cycle",
+		},
+		{
+			name: "user_router acyclic: default + per-user backends all point at non-ALB leaves",
+			albs: map[string]*Options{
+				"alb_ur": {
+					MechanismName: "user_router",
+					UserRouter: &ur.Options{
+						DefaultBackend: "prom_default",
+						Users: ur.UserMappingOptionsByUser{
+							"alice": {ToBackend: "prom_alice"},
+							"bob":   {ToBackend: "prom_bob"},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			// nil UserRouter or empty backend strings must not crash the walk,
+			// nor inflate path/visiting state.
+			name: "user_router nil + empty edges treated as no edge",
+			albs: map[string]*Options{
+				"alb_pool":      {Pool: []string{"prom1"}},
+				"alb_ur_nil":    {MechanismName: "user_router", UserRouter: nil},
+				"alb_ur_empty":  {MechanismName: "user_router", UserRouter: &ur.Options{}},
+				"alb_ur_user0": {
+					MechanismName: "user_router",
+					UserRouter: &ur.Options{
+						Users: ur.UserMappingOptionsByUser{
+							"alice": {ToBackend: ""},
+							"bob":   nil,
+						},
+					},
+				},
 			},
 			wantErr: false,
 		},

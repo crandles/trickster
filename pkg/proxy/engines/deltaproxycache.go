@@ -383,8 +383,15 @@ func DeltaProxyCacheRequest(w http.ResponseWriter, r *http.Request, modeler *tim
 				mts, _, mresp, ferr := fetchExtents(missRanges, frsc,
 					fetchHeaders, client, pr, modeler.WireUnmarshalerReader, span)
 				if ferr != nil {
-					return buildErrorResult(mresp.StatusCode, mresp.Header.Clone(),
-						func() []byte { b, _ := io.ReadAll(mresp.Body); return b }()), nil
+					// mresp.Body is only set inside fetchExtents's non-200
+					// branch; when every shard fails at the transport level
+					// (e.g. dial refused) mresp.Body remains nil and
+					// io.ReadAll(nil) panics on the first Read.
+					var body []byte
+					if mresp.Body != nil {
+						body, _ = io.ReadAll(mresp.Body)
+					}
+					return buildErrorResult(mresp.StatusCode, mresp.Header.Clone(), body), nil
 				}
 				doc.Headers = fetchHeaders
 				// Merge the new delta timeseries into the cached timeseries
