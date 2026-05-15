@@ -282,10 +282,6 @@ func scatter(ctx context.Context, parent *http.Request, targets pool.Targets, cf
 				reason := failureReason(targets[i], "truncated")
 				metrics.ALBFanoutFailures.WithLabelValues(cfg.Mechanism, cfg.Variant, reason).Inc()
 			}
-			// Short-read disqualifier: when the upstream declared a
-			// Content-Length larger than the bytes that actually
-			// arrived, the slot is unusable (the proxy would otherwise
-			// serve a truncated payload under a stale CL).
 			if capt := request.GetUpstreamShortReadCapture(r2.Context()); capt != nil && capt.Tripped() {
 				results[i].Failed = true
 				reason := failureReason(targets[i], "short_read")
@@ -332,12 +328,6 @@ func PrimeBody(parent *http.Request) (*http.Request, error) {
 // PrepareClone does NOT prime parent's body; callers using their own
 // goroutine pool must call request.GetBody on parent before spawning, or
 // the per-clone GetBody calls will race on r.Body / rsc.RequestBody.
-//
-// The cloned request's context is bound to a fresh
-// UpstreamShortReadCapture. The proxy engine's body-copy step marks it
-// when an io.Copy from the upstream returns an error and the upstream
-// had declared a Content-Length; the fanout gather loop reads it via
-// r2.Context() to disqualify slots whose upstream truncated mid-body.
 func PrepareClone(ctx context.Context, parent *http.Request, idx int, cfg Config) (*http.Request, *capture.CaptureResponseWriter, error) {
 	r2, err := request.CloneWithoutResources(parent)
 	if err != nil {

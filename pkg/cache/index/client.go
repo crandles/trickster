@@ -340,10 +340,9 @@ func (idx *IndexedClient) flusher(ctx context.Context) {
 	})
 }
 
-// workerPanicHandler returns a safego.PanicHandler that logs the panic
-// with the worker label, increments CacheIndexPanicRecovered, and flips
-// the supplied exited flag so the operator-facing health endpoint can
-// surface the dead worker. Used by both flusher and reaper.
+// workerPanicHandler returns a safego.PanicHandler that logs, increments
+// CacheIndexPanicRecovered{worker}, and flips exited so the health
+// endpoint can surface the dead worker.
 func (idx *IndexedClient) workerPanicHandler(worker string, exited *atomic.Bool) safego.PanicHandler {
 	return func(r any, stack []byte) {
 		logger.Error("cache index "+worker+" panic", logging.Pairs{

@@ -25,15 +25,9 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/timeseries"
 )
 
-// TestPropertyDefaultMergerPreservesWarnings is the property formulation of
-// the regression fixed in the alb-cont round-3 hardening sweep: every
-// per-shard Warning emitted by any input DataSet must appear in the merged
-// result, regardless of how many shards or in what order they arrive.
-// Multiset equality is the contract; ordering across shards is not promised.
+// Invariant: merged Warnings == multiset(receiver + each input).
 func TestPropertyDefaultMergerPreservesWarnings(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
-		// Receiver + 1-4 inputs. The receiver's own Warnings are part of the
-		// expected multiset; the merge appends each input's warnings in turn.
 		recvWarn := rapid.SliceOfN(rapid.String(), 0, 4).Draw(rt, "recvWarnings")
 		inputCount := rapid.IntRange(1, 4).Draw(rt, "inputs")
 		inputs := make([]timeseries.Timeseries, inputCount)
@@ -56,15 +50,11 @@ func TestPropertyDefaultMergerPreservesWarnings(t *testing.T) {
 	})
 }
 
-// TestPropertyDefaultMergerStatusPreference asserts the permutation-invariant
-// part of the Status precedence at dataset.go:267-269:
+// Permutation-invariant Status precedence:
+//   - any input "success" -> result "success"
+//   - all-empty -> result ""
 //
-//   - any input with Status == "success" -> result is "success"
-//   - all inputs (including receiver) with Status == "" -> result is ""
-//
-// The middle case (mixed non-success non-empty) is order-dependent because
-// DefaultMerger preserves the first-seen non-empty Status; that piece is
-// covered by the existing dataset_merger_warnings_test.go cases.
+// The mixed-non-success case is order-dependent and not asserted here.
 func TestPropertyDefaultMergerStatusPreference(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		choices := []string{"", "success", "error", "warning"}
@@ -94,10 +84,6 @@ func TestPropertyDefaultMergerStatusPreference(t *testing.T) {
 	})
 }
 
-// TestPropertyDefaultMergerIdempotent asserts merging an empty collection is
-// a no-op on Warnings and Status. Surfaces the trivial idempotence
-// invariant; if a future caller relies on `Merge(empty)` resetting state,
-// this property fails first.
 func TestPropertyDefaultMergerIdempotent(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		warnings := rapid.SliceOfN(rapid.String(), 0, 4).Draw(rt, "warnings")

@@ -135,7 +135,7 @@ func newInsecureClient(t *testing.T, timeout time.Duration) *http.Client {
 	return c
 }
 
-func TestNewHTTPClient_PinsHTTP1OverTLSALPN(t *testing.T) {
+func TestNewHTTPClient_NegotiatesHTTP2OverTLSALPN(t *testing.T) {
 	srv := newH2OfferingServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Proto", r.Proto)
 		w.WriteHeader(http.StatusOK)
@@ -151,11 +151,8 @@ func TestNewHTTPClient_PinsHTTP1OverTLSALPN(t *testing.T) {
 	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		t.Fatalf("read body: %v", err)
 	}
-	if !strings.HasPrefix(resp.Proto, "HTTP/1.") {
-		t.Errorf("expected HTTP/1.x, got %s (server X-Proto=%s)", resp.Proto, resp.Header.Get("X-Proto"))
-	}
-	if resp.ProtoMajor != 1 {
-		t.Errorf("expected ProtoMajor=1, got %d", resp.ProtoMajor)
+	if resp.ProtoMajor != 2 {
+		t.Errorf("expected HTTP/2, got %s (server X-Proto=%s)", resp.Proto, resp.Header.Get("X-Proto"))
 	}
 }
 
@@ -191,9 +188,6 @@ func TestNewHTTPClient_ContextCancelMidStream(t *testing.T) {
 	if err != nil {
 		cancel()
 		t.Fatalf("Do: %v", err)
-	}
-	if !strings.HasPrefix(resp.Proto, "HTTP/1.") {
-		t.Errorf("expected HTTP/1.x even with h2 ALPN offered, got %s", resp.Proto)
 	}
 
 	readDone := make(chan error, 1)
@@ -232,7 +226,7 @@ func TestNewHTTPClient_ContextCancelMidStream(t *testing.T) {
 	}
 }
 
-func TestNewHTTPClient_TransportDisablesH2(t *testing.T) {
+func TestNewHTTPClient_TransportEnablesH2(t *testing.T) {
 	o := bo.New()
 	c, err := NewHTTPClient(o)
 	if err != nil {
@@ -242,27 +236,18 @@ func TestNewHTTPClient_TransportDisablesH2(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *http.Transport, got %T", c.Transport)
 	}
-	if tr.ForceAttemptHTTP2 {
-		t.Errorf("ForceAttemptHTTP2 should be false")
-	}
-	if tr.TLSNextProto == nil {
-		t.Errorf("TLSNextProto should be non-nil empty map to suppress h2 negotiation")
+	if !tr.ForceAttemptHTTP2 {
+		t.Errorf("ForceAttemptHTTP2 should be true to opt into h2 alongside the custom Dial / TLSClientConfig")
 	}
 	if len(tr.TLSNextProto) != 0 {
-		t.Errorf("TLSNextProto should be empty, got %d entries", len(tr.TLSNextProto))
+		t.Errorf("TLSNextProto should be empty (not used to block h2); got %d entries", len(tr.TLSNextProto))
 	}
 }
 
-// TestNewHTTPClient_SigV4WrapsIdleCloser asserts that when SigV4 signing is
-// configured, the resulting client's Transport still satisfies the
-// idleCloser interface used by backends.CloseIdleConnections during config
-// reload. The upstream sigV4RoundTripper from prometheus/common does not
-// implement CloseIdleConnections; without our wrapper, a reload sweep would
-// silently skip SigV4 backends and leak their idle connections.
 func TestNewHTTPClient_SigV4WrapsIdleCloser(t *testing.T) {
 	o := bo.New()
-	// Static credentials skip the AWS credential-provider chain lookup, which
-	// would fail in unit-test env without ~/.aws or env vars.
+	// Static creds skip the AWS provider chain so unit-test env without
+	// ~/.aws or env vars doesn't fail signer construction.
 	o.SigV4 = &sigv4.SigV4Config{
 		Region:    "us-east-1",
 		AccessKey: "AKIATEST",
@@ -273,9 +258,9 @@ func TestNewHTTPClient_SigV4WrapsIdleCloser(t *testing.T) {
 		t.Fatalf("NewHTTPClient: %v", err)
 	}
 	type idleCloser interface{ CloseIdleConnections() }
-	if _, ok := c.Transport.(idleCloser); !ok {
+	ic, ok := c.Transport.(idleCloser)
+	if !ok {
 		t.Fatalf("SigV4 client Transport %T does not satisfy idleCloser", c.Transport)
 	}
-	// And it must not panic.
-	c.Transport.(idleCloser).CloseIdleConnections()
+	ic.CloseIdleConnections()
 }

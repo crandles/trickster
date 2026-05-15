@@ -150,18 +150,15 @@ func Target(h http.Handler) (*pool.Target, *healthcheck.Status) {
 }
 
 // HealthyTarget builds a single *pool.Target with its status pre-set to
-// StatusPassing. Replaces the mkFlapTarget pattern (target + Set passing)
-// duplicated across fanout/* tests.
+// StatusPassing.
 func HealthyTarget(h http.Handler) (*pool.Target, *healthcheck.Status) {
 	tgt, st := Target(h)
 	st.Set(healthcheck.StatusPassing)
 	return tgt, st
 }
 
-// PanicHandler returns an http.Handler that panics with the canonical
-// simulated-upstream string. Used by FR/NLM/TSM panic regression tests to
-// verify mechanism recover wraps swallow the panic without crossing
-// ServeHTTP.
+// PanicHandler returns an http.Handler that panics with a canonical
+// simulated-upstream string.
 func PanicHandler() http.Handler {
 	return http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		panic("simulated upstream nil deref")
@@ -170,8 +167,7 @@ func PanicHandler() http.Handler {
 
 // SizedBodyHandler returns an http.Handler that emits a body of size bytes
 // (filled with 'a') under an explicit Content-Length: size header with the
-// given status code. Exercises the truncated-upstream defense in FR/NLM/TSM
-// when MaxCaptureBytes is below size.
+// given status code.
 func SizedBodyHandler(code, size int) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		body := make([]byte, size)
@@ -184,11 +180,9 @@ func SizedBodyHandler(code, size int) http.Handler {
 	})
 }
 
-// ServeAndWait runs h.ServeHTTP(w, r) in a goroutine with a deferred recover
-// (panic reported via t.Errorf) and asserts the call returns within 5s.
-// Replaces the done-chan + select boilerplate duplicated across
-// `*_panic_test.go`. Callers retain ownership of post-call status/body
-// assertions.
+// ServeAndWait runs h.ServeHTTP(w, r) in a goroutine with a deferred
+// recover (panic reported via t.Errorf) and asserts the call returns
+// within 5s.
 func ServeAndWait(t testing.TB, h http.Handler, w http.ResponseWriter, r *http.Request) {
 	t.Helper()
 	done := make(chan struct{})
@@ -208,12 +202,11 @@ func ServeAndWait(t testing.TB, h http.Handler, w http.ResponseWriter, r *http.R
 	}
 }
 
-// RunPostBodyFanoutRace builds a `slots`-upstream pool whose stubs verify the
-// parent body arrives intact, then drives `callers` parallel POSTs against
-// the handler returned by mkHandler(p). Each upstream optionally invokes
-// decorateResp before WriteHeader (eg to set Last-Modified for NLM). Run
-// under -race to catch parent-body fanout regressions. Replaces the
-// drivers duplicated across `*_post_race_test.go`.
+// RunPostBodyFanoutRace builds a `slots`-upstream pool whose stubs verify
+// the parent body arrives intact, then drives `callers` parallel POSTs
+// against the handler returned by mkHandler(p). decorateResp is invoked
+// in each upstream stub before WriteHeader (eg to set Last-Modified).
+// Run under -race.
 func RunPostBodyFanoutRace(
 	t testing.TB,
 	mkHandler func(p pool.Pool) http.Handler,
@@ -265,7 +258,6 @@ func RunPostBodyFanoutRace(
 
 // RequireFanoutAttemptDelta runs fn and asserts that the
 // metrics.ALBFanoutAttempts counter for (mech, variant) advanced by want.
-// Replaces hand-rolled testutil.ToFloat64 before/after subtraction.
 func RequireFanoutAttemptDelta(t testing.TB, mech, variant string, want float64, fn func()) {
 	t.Helper()
 	before := testutil.ToFloat64(metrics.ALBFanoutAttempts.WithLabelValues(mech, variant))

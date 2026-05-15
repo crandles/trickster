@@ -35,19 +35,6 @@ import (
 	"github.com/trickstercache/trickster/v2/integration/internal/chaos"
 )
 
-// TestALBChaosBehaviors drives each ALB winner-takes-all mechanism (fr, nlm)
-// against a 2-target pool consisting of one always-healthy stub and one
-// chaos-misbehaving stub. The chaos stub's healthcheck endpoint always
-// responds 200 (so it joins the dispatch set), but its data path emits the
-// configured misbehavior.
-//
-// This test exists to make `integration/internal/chaos` a real consumer
-// instead of an unused fixture library, and to drive each misbehavior
-// through the real proxy + ALB path so a regression that crashes the
-// process or breaks startup is caught. Stricter correctness assertions
-// (eg "chaos stub never wins for FR") are deferred until the adjacent-bug
-// fixes in PR 3 land; today the proxy still serves short bodies under a
-// stale Content-Length (see [proxy_request.go:436]).
 func TestALBChaosBehaviors(t *testing.T) {
 	if testing.Short() {
 		t.Skip("chaos matrix is slow; skipping in -short mode")
@@ -94,8 +81,6 @@ func runChaosCell(t *testing.T, mech, behavior string, chaosData http.HandlerFun
 	go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
 	waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
 
-	// Let healthchecks converge. Both stubs answer 200 on /buildinfo, so both
-	// join the pool; the data-path misbehavior is what the ALB must absorb.
 	time.Sleep(800 * time.Millisecond)
 
 	cli := &http.Client{
@@ -135,15 +120,9 @@ func runChaosCell(t *testing.T, mech, behavior string, chaosData http.HandlerFun
 	}
 	t.Logf("%s/%s: ok=%d nonOK=%d short=%d", mech, behavior, ok, nonOK, short)
 
-	// Every request must get a terminal response (process is still running).
 	assert.Equalf(t, reqs, ok+nonOK,
 		"%s/%s: %d/%d requests dropped (transport-level failure)",
 		mech, behavior, reqs-(ok+nonOK), reqs)
-	// The truncate_stale_cl chaos stub declares Content-Length: 4096 and
-	// writes 16 bytes. With the fanout short-read disqualifier wired up
-	// (pkg/backends/alb/mech/fanout/fanout.go), FR/NLM must reject the
-	// chaos slot and serve the healthy member's full body, not the
-	// truncated 16-byte body.
 	if behavior == "truncate_stale_cl" {
 		assert.Zerof(t, short,
 			"%s/%s: served %d short bodies; chaos stub should be disqualified by short-read check",
@@ -151,12 +130,9 @@ func runChaosCell(t *testing.T, mech, behavior string, chaosData http.HandlerFun
 	}
 }
 
-// pathAwareStub serves /api/v1/status/buildinfo with a fixed healthy 200
-// response and routes all other paths to the supplied data handler. This
-// lets a chaos handler misbehave only on data queries, so the pool's
-// healthcheck still treats the stub as available. Panics from `data`
-// propagate to net/http's default recover, which closes the connection
-// without writing -- the same shape a buggy real upstream produces.
+// pathAwareStub serves a fixed healthy 200 on /api/v1/status/buildinfo and
+// routes all other paths to the supplied data handler, so chaos handlers
+// can misbehave on data queries while still passing healthcheck.
 type pathAwareStub struct {
 	srv *httptest.Server
 	URL string

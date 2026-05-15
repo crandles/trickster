@@ -14,12 +14,9 @@
  * limitations under the License.
  */
 
-// Package golden provides shared JSON-fixture helpers used by tests that
-// maintain on-disk golden files under testdata/. Tests can opt into the
-// regenerate-on-flag pattern by checking Update and calling WriteJSON in
-// bootstrap tests. The package owns the -update flag so multiple consumers
-// (eg pkg/backends/alb/mech/tsm + future fr/nlm body fixtures) share one
-// switch.
+// Package golden holds JSON-fixture helpers for tests that maintain
+// testdata/ goldens. The package owns the shared -update flag so
+// multiple consumers route through one switch.
 package golden
 
 import (
@@ -30,13 +27,11 @@ import (
 	"testing"
 )
 
-// Update is the shared -update flag. Bootstrap tests that maintain JSON
-// fixtures should check *Update and call WriteJSON when set.
+// Update is the shared -update flag for golden regeneration.
 var Update = flag.Bool("update", false, "rewrite testdata/*.json golden fixtures from current test output")
 
-// LoadJSON reads testdata/<name>.json relative to the calling test's package
-// directory and decodes it into out. The error message points at the
-// -update flag when the file is missing.
+// LoadJSON reads testdata/<name>.json relative to the calling test's
+// package directory and decodes it into out.
 func LoadJSON(t testing.TB, name string, out any) {
 	t.Helper()
 	path := filepath.Join("testdata", name+".json")
@@ -50,8 +45,7 @@ func LoadJSON(t testing.TB, name string, out any) {
 }
 
 // WriteJSON marshals v with MarshalIndent and writes it to
-// testdata/<name>.json, creating the directory if necessary. Used by
-// bootstrap tests under `go test -update`.
+// testdata/<name>.json, creating the directory if necessary.
 func WriteJSON(t testing.TB, name string, v any) {
 	t.Helper()
 	path := filepath.Join("testdata", name+".json")

@@ -25,20 +25,9 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/backends/healthcheck"
 )
 
-// TestPropertyPoolTargetsRespectsFloor is a state-machine property test that
-// drives RefreshHealthy / status flips / Targets in random sequences against
-// a fixed-size pool. The invariant is that p.Targets() never returns a
-// target whose current hcStatus is below the healthy floor, regardless of
-// how status flips and refreshes interleave.
-//
-// This is the invariant the round-3 fixes for SetPool/dispatch race and
-// healthyTargets-vs-liveTargets sync exist to enforce; expressing it as a
-// property catches any future divergence between the cached fast path
-// (pool.go:108-131) and the snapshot+filter fallback.
-//
-// Concurrency is sequential (rapid actions run on the test goroutine); the
-// per-action atomic flips still exercise the atomic.Pointer fast/slow path
-// transitions because allLive checks the live target's current hcStatus.
+// Invariant: p.Targets() never returns a target whose current hcStatus
+// is below the healthy floor, across any interleaving of status flips
+// and refreshes.
 func TestPropertyPoolTargetsRespectsFloor(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		const n = 4
@@ -53,7 +42,6 @@ func TestPropertyPoolTargetsRespectsFloor(t *testing.T) {
 		defer p.Stop()
 		p.RefreshHealthy()
 
-		// expectedLive is the model: indices currently passing the floor.
 		expectedLive := func() map[*Target]bool {
 			m := make(map[*Target]bool, n)
 			for i, s := range statuses {
@@ -68,15 +56,12 @@ func TestPropertyPoolTargetsRespectsFloor(t *testing.T) {
 			got := p.Targets()
 			want := expectedLive()
 			for _, tgt := range got {
-				if tgt == nil {
-					rt.Fatalf("Targets() returned nil entry")
-				}
-				if tgt.hcStatus == nil {
-					rt.Fatalf("Targets() returned target with nil hcStatus")
+				if tgt == nil || tgt.hcStatus == nil {
+					rt.Fatalf("Targets() returned nil-status entry: %v", tgt)
 				}
 				if tgt.hcStatus.Get() < healthcheck.StatusPassing {
-					rt.Fatalf("Targets() returned target with status %d (< floor %d)",
-						tgt.hcStatus.Get(), healthcheck.StatusPassing)
+					rt.Fatalf("Targets() returned target with status %d below floor",
+						tgt.hcStatus.Get())
 				}
 				if !want[tgt] {
 					rt.Fatalf("Targets() returned target not currently passing")
@@ -95,19 +80,12 @@ func TestPropertyPoolTargetsRespectsFloor(t *testing.T) {
 					statuses[i].Set(healthcheck.StatusFailing)
 				}
 			},
-			"refresh": func(_ *rapid.T) {
-				p.RefreshHealthy()
-			},
-			"targets": func(_ *rapid.T) {
-				_ = p.Targets()
-			},
+			"refresh": func(_ *rapid.T) { p.RefreshHealthy() },
+			"targets": func(_ *rapid.T) { _ = p.Targets() },
 		})
 	})
 }
 
-// TestPropertyPoolStopIdempotent asserts repeated Stop() calls don't panic
-// and don't leak. The stopOnce guard at pool.go:149 is the load-bearing
-// piece; this property guards against a refactor that drops it.
 func TestPropertyPoolStopIdempotent(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		const n = 3

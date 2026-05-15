@@ -96,9 +96,8 @@ func NewHTTPClient(o *bo.Options) (*http.Client, error) {
 			ExpectContinueTimeout: o.Timeout,
 			ResponseHeaderTimeout: o.Timeout,
 			TLSClientConfig:       TLSConfig,
-			// pin upstream to HTTP/1.1: GOAWAY/stream-reset semantics on h2 are not exercised by trickster's fanout paths
-			ForceAttemptHTTP2: false,
-			TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
+			// explicit: Go suppresses h2 auto-enable when Dial or TLSClientConfig is custom.
+			ForceAttemptHTTP2: true,
 		},
 	}
 
@@ -108,27 +107,19 @@ func NewHTTPClient(o *bo.Options) (*http.Client, error) {
 		if err != nil {
 			return nil, err
 		}
-		// sigV4RoundTripper does not implement CloseIdleConnections, so a
-		// reload-time backends.CloseIdleConnections sweep would silently
-		// skip SigV4-signed transports and leak their idle conns. Preserve
-		// the close path by wrapping the signed RoundTripper alongside its
-		// inner *http.Transport.
+		// sigV4RoundTripper does not satisfy idleCloser; wrap to keep
+		// CloseIdleConnections reachable on reload.
 		client.Transport = &idleClosingRoundTripper{RoundTripper: wrapped, inner: inner}
 	}
 
 	return client, nil
 }
 
-// idleClosingRoundTripper wraps an http.RoundTripper that doesn't itself
-// implement CloseIdleConnections so the inner *http.Transport's idle
-// conns are still reachable via the standard idleCloser interface used
-// by backends.CloseIdleConnections during config reload.
 type idleClosingRoundTripper struct {
 	http.RoundTripper
 	inner *http.Transport
 }
 
-// CloseIdleConnections forwards to the inner *http.Transport.
 func (i *idleClosingRoundTripper) CloseIdleConnections() {
 	if i.inner != nil {
 		i.inner.CloseIdleConnections()

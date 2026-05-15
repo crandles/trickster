@@ -14,29 +14,18 @@
  * limitations under the License.
  */
 
-// Package safego is a tiny shared helper for spawning goroutines whose
-// panics must not crash the process. It hoists the `go { defer recover()
-// { handler(r) } }` boilerplate so each consumer only writes the panic
-// handler (typically log + metric increment). Callers retain full
-// control over the metric name, labels, and any side effects (eg
-// flipping an "exited" flag) by passing a closure.
-//
-// The helper does not pick a counter or log message; that's intentional.
-// Each consumer has its own observability surface and labels, and one-
-// size-fits-all has driven the prior ad-hoc duplication this package
-// replaces.
+// Package safego spawns goroutines whose panics must not crash the
+// process. Callers pass a PanicHandler closure; the package only owns
+// the `go { defer recover() { handler(r) } }` boilerplate.
 package safego
 
 import "runtime/debug"
 
-// PanicHandler is invoked when Go or Run recovers a panic. r is the
-// value passed to panic(); stack is the goroutine's stack trace at the
-// point of recovery.
+// PanicHandler is invoked on a recovered panic with the value and stack.
 type PanicHandler func(r any, stack []byte)
 
-// Go starts fn in a new goroutine. On panic, handler is invoked with
-// the recovered value and stack trace. Use Run if fn is already running
-// inside a goroutine body.
+// Go starts fn in a new goroutine, recovering panics into handler. Use
+// Run when fn is already inside a goroutine body.
 func Go(handler PanicHandler, fn func()) {
 	go Run(handler, fn)
 }

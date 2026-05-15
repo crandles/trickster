@@ -28,12 +28,6 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/testutil/albpool"
 )
 
-// TestScatterShortReadDisqualifies asserts that when a target's handler
-// flips the UpstreamShortReadCapture (the signal the proxy engine raises
-// when it reads fewer body bytes from the upstream than the declared
-// Content-Length), scatter marks the slot Failed and increments the
-// short_read failure metric. This mirrors the runtime path the proxy
-// engine uses to surface a truncated origin response to fanout.
 func TestScatterShortReadDisqualifies(t *testing.T) {
 	short := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if c := request.GetUpstreamShortReadCapture(r.Context()); c != nil {
@@ -51,13 +45,9 @@ func TestScatterShortReadDisqualifies(t *testing.T) {
 		Config{Mechanism: "test-short-read", Variant: ""})
 	require.NoError(t, err)
 	require.Len(t, results, 1)
-	require.True(t, results[0].Failed,
-		"slot must be Failed when proxy marks the short-read sidecar")
+	require.True(t, results[0].Failed)
 }
 
-// TestScatterMatchingLengthPasses confirms the disqualifier only fires
-// when the sidecar is marked. A handler that does NOT mark the sidecar
-// (the common case: full body received) must NOT be marked Failed.
 func TestScatterMatchingLengthPasses(t *testing.T) {
 	full := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -72,14 +62,9 @@ func TestScatterMatchingLengthPasses(t *testing.T) {
 		Config{Mechanism: "test-full-read", Variant: ""})
 	require.NoError(t, err)
 	require.Len(t, results, 1)
-	require.False(t, results[0].Failed,
-		"slot must NOT be Failed when no short-read was marked")
+	require.False(t, results[0].Failed)
 }
 
-// TestScatterNoCaptureNoSignal documents the fallback: the short-read
-// check is opt-in via the sidecar bound by PrepareClone. Tests that
-// don't go through PrepareClone (none today, but defense in depth)
-// would never trip the check.
 func TestScatterNoCaptureNoSignal(t *testing.T) {
 	tiny := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

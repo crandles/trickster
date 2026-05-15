@@ -21,55 +21,37 @@ import (
 	"sync/atomic"
 )
 
-// UpstreamShortReadCapture is a sidecar that lets the proxy engine flag
-// "we did not receive the full upstream body" to the ALB fanout layer
-// without involving response headers (which may be modified or
-// transformed by mechanism-specific rewriters before the fanout layer
-// sees them). ALB sets one of these on its cloned-request context
-// before dispatch. The proxy's body-copy step (proxy_request.go's
-// writeResponseBody) marks it when an io.Copy from the upstream returns
-// an error and the upstream had declared a Content-Length, which is
-// exactly the truncated-CL signal that this PR's chaos test exercises.
-// Fanout reads the flag via Tripped() and disqualifies the slot.
-//
-// Non-ALB callers never bind one to the context, so the proxy's lookup
-// returns nil and the path is a silent no-op.
+// UpstreamShortReadCapture is a context sidecar that the proxy engine
+// trips when an upstream's body ended before its declared Content-Length.
+// ALB fanout binds one per shard and reads Tripped() to disqualify the
+// slot; non-ALB callers leave it unbound and the proxy path is a no-op.
 type UpstreamShortReadCapture struct {
 	tripped atomic.Bool
 }
 
-// Mark sets the short-read flag. Safe for concurrent use.
-func (c *UpstreamShortReadCapture) Mark() {
-	c.tripped.Store(true)
-}
+// Mark flags a short read. Safe for concurrent use.
+func (c *UpstreamShortReadCapture) Mark() { c.tripped.Store(true) }
 
-// Tripped reports whether the proxy marked a short read.
-func (c *UpstreamShortReadCapture) Tripped() bool {
-	return c.tripped.Load()
-}
+// Tripped reports whether Mark was called.
+func (c *UpstreamShortReadCapture) Tripped() bool { return c.tripped.Load() }
 
 type shortReadKey struct{}
 
-// WithUpstreamShortReadCapture binds a fresh capture to ctx and returns
-// the new context plus the capture pointer. Callers retain the pointer
-// to read Tripped() after the handler returns.
+// WithUpstreamShortReadCapture binds a fresh capture to ctx.
 func WithUpstreamShortReadCapture(ctx context.Context) (context.Context, *UpstreamShortReadCapture) {
 	c := &UpstreamShortReadCapture{}
 	return context.WithValue(ctx, shortReadKey{}, c), c
 }
 
-// GetUpstreamShortReadCapture returns the capture bound to ctx, or nil
-// if no capture is bound (non-ALB context).
+// GetUpstreamShortReadCapture returns the capture bound to ctx, or nil.
 func GetUpstreamShortReadCapture(ctx context.Context) *UpstreamShortReadCapture {
 	c, _ := ctx.Value(shortReadKey{}).(*UpstreamShortReadCapture)
 	return c
 }
 
-// RebindUpstreamShortReadCapture copies the capture (if any) from src
-// onto dst, returning the (possibly modified) dst. cloneRequestWithSpan
-// uses this to preserve the sidecar across the proxy engine's internal
-// request clone, which intentionally builds a fresh context.Background()
-// and would otherwise drop the capture set by the ALB fanout layer.
+// RebindUpstreamShortReadCapture carries the capture (if any) from src
+// onto dst. Needed when callers rebuild the context from
+// context.Background() and would otherwise drop the binding.
 func RebindUpstreamShortReadCapture(dst, src context.Context) context.Context {
 	if c := GetUpstreamShortReadCapture(src); c != nil {
 		return context.WithValue(dst, shortReadKey{}, c)

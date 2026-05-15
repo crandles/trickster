@@ -63,10 +63,6 @@ func TestGoSpawnsGoroutineAndRecovers(t *testing.T) {
 	}
 }
 
-func TestRunNilHandlerStillRecovers(t *testing.T) {
-	// Defensive: callers can pass a no-op handler, but we should not panic
-	// out of Run if the panic is recovered even when the handler is
-	// effectively empty.
+func TestRunNoopHandlerStillRecovers(t *testing.T) {
 	Run(func(_ any, _ []byte) {}, func() { panic("ignored") })
-	// reaching here means the panic did not escape; no further assert.
 }

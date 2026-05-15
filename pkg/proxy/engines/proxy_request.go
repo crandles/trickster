@@ -437,10 +437,6 @@ func (pr *proxyRequest) writeResponseBody() {
 	n, err := io.Copy(pr.responseWriter, pr.upstreamReader)
 	if err != nil {
 		logger.Error("error copying upstream response body", logging.Pairs{"error": err})
-		// If the upstream declared a Content-Length and we read fewer
-		// bytes than declared, flag the ALB short-read sidecar so the
-		// fanout layer can disqualify this slot. Non-ALB requests have
-		// no sidecar bound, so this is a silent no-op for them.
 		if pr.upstreamResponse != nil && pr.upstreamResponse.ContentLength > 0 &&
 			n < pr.upstreamResponse.ContentLength {
 			if c := request.GetUpstreamShortReadCapture(pr.upstreamRequest.Context()); c != nil {
