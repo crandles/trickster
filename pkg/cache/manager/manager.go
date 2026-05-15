@@ -187,11 +187,14 @@ func (cm *Manager) Retrieve(cacheKey string) ([]byte, status.LookupStatus, error
 }
 
 func (cm *Manager) Remove(cacheKeys ...string) error {
+	if len(cacheKeys) == 0 {
+		return nil
+	}
 	if !cm.acquire() {
 		return ErrCacheClosed
 	}
 	defer cm.release()
-	metrics.ObserveCacheDel(cm.config.Name, cm.config.Provider, float64(len(cacheKeys)-1))
+	metrics.ObserveCacheDel(cm.config.Name, cm.config.Provider, float64(len(cacheKeys)))
 	logger.Debug("cache remove", logging.Pairs{"keys": cacheKeys, "provider": cm.config.Provider})
 	return cm.Client.Remove(cacheKeys...)
 }

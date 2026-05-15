@@ -47,6 +47,10 @@ var (
 	ErrInvalidCacheBackend  = errors.New("invalid cache backend for reference access")
 )
 
+// maxIndexBytes caps the index blob read from the backing cache at startup so
+// a poisoned shared backend can't drive unbounded msgpack decode allocation.
+const maxIndexBytes = 256 << 20
+
 // IndexedClientOptions modify an IndexedClient's behavior.
 type IndexedClientOptions struct {
 	NeedsFlushInterval bool
@@ -85,11 +89,15 @@ func NewIndexedClient(
 			logger.Warn("cache index was not loaded",
 				logging.Pairs{"cacheName": cacheName, "error": err.Error()})
 		} else if len(b) > 0 && s == status.LookupStatusHit {
-			// if an index was cached, load it
-			idx.UnmarshalMsg(b)
-			if time.Since(idx.LastFlush.Load()) > indexExpiry {
-				// if the index is stale, clear it
-				idx.Clear()
+			if len(b) > maxIndexBytes {
+				// Reject oversized blobs to bound alloc on poisoned shared-backend writes.
+				logger.Warn("cache index too large; discarding",
+					logging.Pairs{"cacheName": cacheName, "bytes": len(b), "max": maxIndexBytes})
+			} else {
+				idx.UnmarshalMsg(b)
+				if time.Since(idx.LastFlush.Load()) > indexExpiry {
+					idx.Clear()
+				}
 			}
 		}
 		if o.FlushInterval > 0 {
