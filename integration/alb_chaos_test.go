@@ -34,6 +34,7 @@ import (
 
 	"github.com/trickstercache/trickster/v2/integration/internal/chaos"
 	"github.com/trickstercache/trickster/v2/integration/internal/portutil"
+	"github.com/trickstercache/trickster/v2/integration/promstub"
 )
 
 func TestALBChaosBehaviors(t *testing.T) {
@@ -164,24 +165,10 @@ func writeChaosConfig(t *testing.T, mech string, frontPort, metricsPort, mgmtPor
 ) string {
 	t.Helper()
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "frontend:\n  listen_port: %d\n", frontPort)
-	fmt.Fprintf(&sb, "metrics:\n  listen_port: %d\n", metricsPort)
-	fmt.Fprintf(&sb, "mgmt:\n  listen_port: %d\n", mgmtPort)
-	sb.WriteString("logging:\n  log_level: error\n")
-	sb.WriteString("caches:\n  mem1:\n    provider: memory\n")
+	sb.WriteString(promstub.Preamble(frontPort, metricsPort, mgmtPort))
 	sb.WriteString("backends:\n")
 	for i, u := range []string{healthyURL, chaosURL} {
-		fmt.Fprintf(&sb, "  prom%d:\n", i)
-		sb.WriteString("    provider: prometheus\n")
-		fmt.Fprintf(&sb, "    origin_url: %s\n", u)
-		sb.WriteString("    cache_name: mem1\n")
-		sb.WriteString("    healthcheck:\n")
-		sb.WriteString("      path: /api/v1/status/buildinfo\n")
-		sb.WriteString("      query: \"\"\n")
-		sb.WriteString("      interval: 100ms\n")
-		sb.WriteString("      timeout: 500ms\n")
-		sb.WriteString("      failure_threshold: 1\n")
-		sb.WriteString("      recovery_threshold: 1\n")
+		sb.WriteString(promstub.BackendStanza(fmt.Sprintf("prom%d", i), u))
 	}
 	fmt.Fprintf(&sb, "  alb-%s:\n", mech)
 	sb.WriteString("    provider: alb\n")

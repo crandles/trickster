@@ -33,6 +33,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/trickstercache/trickster/v2/integration/promstub"
 )
 
 // Issue #996: an ALB whose pool contains another ALB ("nested") was reported
@@ -43,7 +44,6 @@ import (
 //   - traffic through alb-outer reaches alb-inner's leaf members
 func TestALBNestedPoolAvailable(t *testing.T) {
 	promRange := albTestdata(t, "alb_nested/prom_range.json.tmpl")
-	const buildInfo = `{"status":"success","data":{"version":"2.0"}}`
 
 	mkRange := func(start, end, step int64) string {
 		var b strings.Builder
@@ -61,12 +61,11 @@ func TestALBNestedPoolAvailable(t *testing.T) {
 	var aHits, bHits atomic.Int64
 	mk := func(hits *atomic.Int64) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			if r.URL.Path == "/api/v1/status/buildinfo" {
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, buildInfo)
+			if r.URL.Path == promstub.BuildInfoPath {
+				promstub.WriteBuildInfo(w)
 				return
 			}
+			w.Header().Set("Content-Type", "application/json")
 			_ = r.ParseForm()
 			start, _ := parseInt(r.Form.Get("start"))
 			end, _ := parseInt(r.Form.Get("end"))

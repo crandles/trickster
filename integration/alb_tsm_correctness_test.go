@@ -33,21 +33,20 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/trickstercache/trickster/v2/integration/promstub"
 )
 
 func TestALBTSMCorrectness(t *testing.T) {
 	t.Run("D1 single member skips label stripping", func(t *testing.T) {
 		vectorBody := albTestdata(t, "alb_tsm_correctness/d1_vector.json")
 		mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			switch r.URL.Path {
-			case "/api/v1/status/buildinfo":
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
-			default:
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, vectorBody)
+			if r.URL.Path == promstub.BuildInfoPath {
+				promstub.WriteBuildInfo(w)
+				return
 			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, vectorBody)
 		}))
 		t.Cleanup(mock.Close)
 
@@ -123,12 +122,11 @@ func TestALBTSMCorrectness(t *testing.T) {
 		var sumHits, countHits, otherHits atomic.Int64
 		makeMock := func(sumVal string) *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				if r.URL.Path == "/api/v1/status/buildinfo" {
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
 					return
 				}
+				w.Header().Set("Content-Type", "application/json")
 				_ = r.ParseForm()
 				q := r.Form.Get("query")
 				switch {
@@ -239,24 +237,22 @@ func TestALBTSMCorrectness(t *testing.T) {
 
 		makeOK := func() *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				if r.URL.Path == "/api/v1/status/buildinfo" {
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
 					return
 				}
+				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 				fmt.Fprint(w, okVector)
 			}))
 		}
 		makeBroken := func() *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				if r.URL.Path == "/api/v1/status/buildinfo" {
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
 					return
 				}
+				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
 				fmt.Fprint(w, `{"status":"error","errorType":"internal","error":"upstream down"}`)
 			}))

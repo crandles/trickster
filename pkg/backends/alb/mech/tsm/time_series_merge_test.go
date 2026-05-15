@@ -91,3 +91,44 @@ func TestHandleResponseMerge(t *testing.T) {
 		t.Error("expected 200 got", w.Code)
 	}
 }
+
+// A panicking pool member must not crash the request. RecoverFanoutPanic("tsm",
+// ...) at time_series_merge.go must catch it and mark the slot failed so the
+// merge surfaces the partial-failure (phit) signal.
+func TestTSMPanicMemberDoesNotCrashRequest(t *testing.T) {
+	p, _, _ := albpool.NewHealthy([]http.Handler{
+		http.HandlerFunc(tu.BasicHTTPHandler),
+		albpool.PanicHandler(),
+	})
+	defer p.Stop()
+	albpool.WaitHealthy(t, p, 2)
+
+	rsc := request.NewResources(nil, nil, nil, nil, nil, nil)
+	rsc.IsMergeMember = true
+	r := request.SetResources(albpool.NewParentGET(t), rsc)
+
+	h := &handler{mergePaths: []string{"/"}}
+	h.SetPool(p)
+	w := httptest.NewRecorder()
+	albpool.ServeAndWait(t, h, w, r)
+}
+
+func TestTSMPanicAllMembersDoesNotCrashRequest(t *testing.T) {
+	p, _, _ := albpool.NewHealthy([]http.Handler{albpool.PanicHandler(), albpool.PanicHandler()})
+	defer p.Stop()
+	albpool.WaitHealthy(t, p, 2)
+
+	rsc := request.NewResources(nil, nil, nil, nil, nil, nil)
+	rsc.IsMergeMember = true
+	r := request.SetResources(albpool.NewParentGET(t), rsc)
+
+	h := &handler{mergePaths: []string{"/"}}
+	h.SetPool(p)
+	w := httptest.NewRecorder()
+	albpool.RequireFanoutFailureDelta(t, "tsm", "", "panic", 2, func() {
+		albpool.ServeAndWait(t, h, w, r)
+	})
+	if w.Code < 500 {
+		t.Errorf("expected 5xx, got %d", w.Code)
+	}
+}

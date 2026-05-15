@@ -19,19 +19,16 @@ package fanout
 import (
 	"context"
 	"net/http"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/pool"
-	"github.com/trickstercache/trickster/v2/pkg/backends/healthcheck"
 	"github.com/trickstercache/trickster/v2/pkg/testutil/albpool"
 )
 
 // TestAllRacesPerTargetHealthFlip races per-target hcStatus flips against
 // in-flight fanout.All invocations. The assertion is data-race freedom under
-// -race; success rate of the fanouts is not checked.
+// -race plus a minimum-progress check on both flipper and fanout sides.
 func TestAllRacesPerTargetHealthFlip(t *testing.T) {
 	t.Parallel()
 
@@ -41,80 +38,28 @@ func TestAllRacesPerTargetHealthFlip(t *testing.T) {
 		targets[i], _ = albpool.HealthyTarget(albpool.StatusHandler(http.StatusOK, ""))
 	}
 
-	stop := make(chan struct{})
-	var flipperIters, fanoutIters, succeededSlots atomic.Int64
+	parent := albpool.NewParentGET(t)
+	ctx := context.Background()
+	cfg := Config{Mechanism: "test"}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		toggle := int32(healthcheck.StatusFailing)
-		for {
-			select {
-			case <-stop:
-				return
-			default:
+	res := albpool.RunHealthFlipRace(t, targets, func() int {
+		results, _ := All(ctx, parent, targets, cfg)
+		var ok int
+		for _, r := range results {
+			if !r.Failed {
+				ok++
 			}
-			for _, tgt := range targets {
-				tgt.HealthStatus().Set(toggle)
-			}
-			if toggle == healthcheck.StatusFailing {
-				toggle = healthcheck.StatusPassing
-			} else {
-				toggle = healthcheck.StatusFailing
-			}
-			flipperIters.Add(1)
 		}
-	}()
+		return ok
+	}, 2*time.Second, 50)
 
-	go func() {
-		defer wg.Done()
-		parent := albpool.NewParentGET(t)
-		ctx := context.Background()
-		cfg := Config{Mechanism: "test"}
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			results, _ := All(ctx, parent, targets, cfg)
-			for _, r := range results {
-				if !r.Failed {
-					succeededSlots.Add(1)
-				}
-			}
-			fanoutIters.Add(1)
-		}
-	}()
-
-	// success = ran enough to exercise data races, not a perf benchmark.
-	// Generous deadline gives CI scheduler tail-latency room; low floor means
-	// "ran enough to be meaningful" rather than "ran fast enough to hit N".
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			close(stop)
-			wg.Wait()
-			if fanoutIters.Load() == 0 {
-				t.Fatal("no fanout iterations completed")
-			}
-			if flipperIters.Load() == 0 {
-				t.Fatal("no flipper iterations completed")
-			}
-			if succeededSlots.Load() == 0 {
-				t.Fatal("no fanout slot succeeded; flapper starved every dispatch")
-			}
-			return
-		default:
-			if fanoutIters.Load() >= 50 {
-				close(stop)
-				wg.Wait()
-				return
-			}
-			time.Sleep(time.Millisecond)
-		}
+	if res.FanoutIters == 0 {
+		t.Fatal("no fanout iterations completed")
+	}
+	if res.FlipperIters == 0 {
+		t.Fatal("no flipper iterations completed")
+	}
+	if res.SucceededSlots == 0 {
+		t.Fatal("no fanout slot succeeded; flapper starved every dispatch")
 	}
 }

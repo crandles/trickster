@@ -33,6 +33,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/trickstercache/trickster/v2/integration/promstub"
 )
 
 var respHdrMatrixTmpl = func() string {
@@ -61,12 +62,11 @@ func mkRespHdrMatrix(start, end, step int64, val string) string {
 func TestALBResponseHeadersTSMSetCookie(t *testing.T) {
 	mkOrigin := func(val, cookie string) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			if r.URL.Path == "/api/v1/status/buildinfo" {
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+			if r.URL.Path == promstub.BuildInfoPath {
+				promstub.WriteBuildInfo(w)
 				return
 			}
+			w.Header().Set("Content-Type", "application/json")
 			_ = r.ParseForm()
 			start, _ := parseInt(r.Form.Get("start"))
 			end, _ := parseInt(r.Form.Get("end"))
@@ -157,12 +157,11 @@ func TestALBResponseHeadersTSMContentEncoding(t *testing.T) {
 
 	mkGzipOrigin := func(val string) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			if r.URL.Path == "/api/v1/status/buildinfo" {
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+			if r.URL.Path == promstub.BuildInfoPath {
+				promstub.WriteBuildInfo(w)
 				return
 			}
+			w.Header().Set("Content-Type", "application/json")
 			_ = r.ParseForm()
 			start, _ := parseInt(r.Form.Get("start"))
 			end, _ := parseInt(r.Form.Get("end"))
@@ -178,12 +177,11 @@ func TestALBResponseHeadersTSMContentEncoding(t *testing.T) {
 	}
 	mkPlainOrigin := func(val string) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			if r.URL.Path == "/api/v1/status/buildinfo" {
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+			if r.URL.Path == promstub.BuildInfoPath {
+				promstub.WriteBuildInfo(w)
 				return
 			}
+			w.Header().Set("Content-Type", "application/json")
 			_ = r.ParseForm()
 			start, _ := parseInt(r.Form.Get("start"))
 			end, _ := parseInt(r.Form.Get("end"))

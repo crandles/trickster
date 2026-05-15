@@ -32,6 +32,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/trickstercache/trickster/v2/integration/promstub"
 )
 
 func TestALBCompose(t *testing.T) {
@@ -39,16 +40,14 @@ func TestALBCompose(t *testing.T) {
 
 	mkLeaf := func(name string, hits *atomic.Int64) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			switch r.URL.Path {
-			case "/api/v1/status/buildinfo":
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
-			default:
-				hits.Add(1)
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprintf(w, promResp, name)
+			if r.URL.Path == promstub.BuildInfoPath {
+				promstub.WriteBuildInfo(w)
+				return
 			}
+			w.Header().Set("Content-Type", "application/json")
+			hits.Add(1)
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, promResp, name)
 		}))
 	}
 

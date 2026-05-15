@@ -33,6 +33,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/trickstercache/trickster/v2/integration/promstub"
 )
 
 func TestALBCache(t *testing.T) {
@@ -42,16 +43,14 @@ func TestALBCache(t *testing.T) {
 		var aHits, bHits atomic.Int64
 		mk := func(label, val string, hits *atomic.Int64) *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				switch r.URL.Path {
-				case "/api/v1/status/buildinfo":
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
-				default:
-					hits.Add(1)
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprintf(w, respTmpl, label, val)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
+					return
 				}
+				w.Header().Set("Content-Type", "application/json")
+				hits.Add(1)
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintf(w, respTmpl, label, val)
 			}))
 		}
 		upstreamA := mk("a", "1", &aHits)
@@ -155,12 +154,11 @@ func TestALBCache(t *testing.T) {
 
 		makeOK := func() *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				if r.URL.Path == "/api/v1/status/buildinfo" {
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
 					return
 				}
+				w.Header().Set("Content-Type", "application/json")
 				_ = r.ParseForm()
 				start, _ := parseInt(r.Form.Get("start"))
 				end, _ := parseInt(r.Form.Get("end"))
@@ -175,10 +173,8 @@ func TestALBCache(t *testing.T) {
 		var m2QueryHits atomic.Int64
 		makeBadEncoding := func(qhits *atomic.Int64) *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/api/v1/status/buildinfo" {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
 					return
 				}
 				qhits.Add(1)
@@ -282,12 +278,11 @@ func TestALBCache(t *testing.T) {
 		var m1Hits, m2Hits atomic.Int64
 		mk := func(hits *atomic.Int64) *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				if r.URL.Path == "/api/v1/status/buildinfo" {
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
 					return
 				}
+				w.Header().Set("Content-Type", "application/json")
 				_ = r.ParseForm()
 				start, _ := parseInt(r.Form.Get("start"))
 				end, _ := parseInt(r.Form.Get("end"))

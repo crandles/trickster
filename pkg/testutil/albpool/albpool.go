@@ -28,9 +28,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/pool"
 	"github.com/trickstercache/trickster/v2/pkg/backends/healthcheck"
@@ -276,11 +278,108 @@ func RequireFanoutAttemptDelta(t testing.TB, mech, variant string, want float64,
 // want.
 func RequireFanoutFailureDelta(t testing.TB, mech, variant, reason string, want float64, fn func()) {
 	t.Helper()
-	before := testutil.ToFloat64(metrics.ALBFanoutFailures.WithLabelValues(mech, variant, reason))
+	RequireCounterDelta(t, metrics.ALBFanoutFailures, []string{mech, variant, reason}, want, fn)
+}
+
+// RequireCounterDelta runs fn and asserts the named CounterVec advanced by
+// want for the given labels. Generalises the *FanoutDelta helpers for
+// callers that want to assert on any Prometheus counter.
+func RequireCounterDelta(t testing.TB, vec *prometheus.CounterVec, labels []string, want float64, fn func()) {
+	t.Helper()
+	before := testutil.ToFloat64(vec.WithLabelValues(labels...))
 	fn()
-	after := testutil.ToFloat64(metrics.ALBFanoutFailures.WithLabelValues(mech, variant, reason))
+	after := testutil.ToFloat64(vec.WithLabelValues(labels...))
 	if got := after - before; got != want {
-		t.Errorf("ALBFanoutFailures{mech=%q,variant=%q,reason=%q} delta = %v, want %v",
-			mech, variant, reason, got, want)
+		t.Errorf("counter delta = %v, want %v (labels=%v)", got, want, labels)
+	}
+}
+
+// HealthFlipResult reports the iteration counts and the cumulative count of
+// successful fanout slots observed during RunHealthFlipRace.
+type HealthFlipResult struct {
+	FlipperIters   int64
+	FanoutIters    int64
+	SucceededSlots int64
+}
+
+// RunHealthFlipRace toggles every target's health between Failing and Passing
+// in one goroutine while invoking fanoutFn in another, until fanoutIters
+// reaches earlyExitFanouts or the deadline elapses. fanoutFn must return the
+// number of slots in the fanout that succeeded. Intended for -race coverage
+// of the dispatch-vs-health-flap interleave; the caller is responsible for
+// asserting invariants on the returned counts.
+func RunHealthFlipRace(
+	t testing.TB,
+	targets pool.Targets,
+	fanoutFn func() (slotsSucceeded int),
+	deadline time.Duration,
+	earlyExitFanouts int64,
+) HealthFlipResult {
+	t.Helper()
+	stop := make(chan struct{})
+	var flipperIters, fanoutIters, succeededSlots atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		toggle := int32(healthcheck.StatusFailing)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for _, tgt := range targets {
+				if hs := tgt.HealthStatus(); hs != nil {
+					hs.Set(toggle)
+				}
+			}
+			if toggle == healthcheck.StatusFailing {
+				toggle = healthcheck.StatusPassing
+			} else {
+				toggle = healthcheck.StatusFailing
+			}
+			flipperIters.Add(1)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			succeededSlots.Add(int64(fanoutFn()))
+			fanoutIters.Add(1)
+		}
+	}()
+
+	timer := time.NewTimer(deadline)
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			close(stop)
+			wg.Wait()
+			return HealthFlipResult{
+				FlipperIters:   flipperIters.Load(),
+				FanoutIters:    fanoutIters.Load(),
+				SucceededSlots: succeededSlots.Load(),
+			}
+		default:
+			if earlyExitFanouts > 0 && fanoutIters.Load() >= earlyExitFanouts {
+				close(stop)
+				wg.Wait()
+				return HealthFlipResult{
+					FlipperIters:   flipperIters.Load(),
+					FanoutIters:    fanoutIters.Load(),
+					SucceededSlots: succeededSlots.Load(),
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
 	}
 }

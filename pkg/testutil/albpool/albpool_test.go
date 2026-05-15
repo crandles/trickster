@@ -21,8 +21,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/trickstercache/trickster/v2/pkg/backends/healthcheck"
+	"github.com/trickstercache/trickster/v2/pkg/observability/metrics"
 )
 
 func TestNew_NilHandlers(t *testing.T) {
@@ -136,5 +138,44 @@ func TestTarget(t *testing.T) {
 	}
 	if tgt.HealthStatus() != st {
 		t.Error("Target's status pointer does not match returned status")
+	}
+}
+
+func TestRequireCounterDelta_FailsOnZeroDelta(t *testing.T) {
+	t.Parallel()
+	stub := &testing.T{}
+	RequireCounterDelta(stub, metrics.ALBFanoutAttempts, []string{"requiredelta-test", ""}, 1, func() {
+		// no metric increment; expect helper to fail
+	})
+	if !stub.Failed() {
+		t.Error("RequireCounterDelta did not fail when delta was zero but want=1")
+	}
+}
+
+func TestRequireCounterDelta_PassesOnExactDelta(t *testing.T) {
+	t.Parallel()
+	stub := &testing.T{}
+	RequireCounterDelta(stub, metrics.ALBFanoutAttempts, []string{"requiredelta-pass", ""}, 2, func() {
+		metrics.ALBFanoutAttempts.WithLabelValues("requiredelta-pass", "").Add(2)
+	})
+	if stub.Failed() {
+		t.Error("RequireCounterDelta failed when delta matched want")
+	}
+}
+
+func TestRunHealthFlipRace_ProducesProgress(t *testing.T) {
+	t.Parallel()
+	hs := []http.Handler{StatusHandler(200, "a"), StatusHandler(200, "b")}
+	p, targets, _ := NewHealthy(hs)
+	defer p.Stop()
+	res := RunHealthFlipRace(t, targets, func() int {
+		// trivial work: count live targets each call
+		return len(p.Targets())
+	}, 200*time.Millisecond, 0)
+	if res.FlipperIters == 0 {
+		t.Error("flipper made no progress")
+	}
+	if res.FanoutIters == 0 {
+		t.Error("fanout made no progress")
 	}
 }

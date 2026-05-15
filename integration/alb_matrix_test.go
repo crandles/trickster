@@ -35,6 +35,7 @@ import (
 
 	"github.com/trickstercache/trickster/v2/integration/internal/metricsutil"
 	"github.com/trickstercache/trickster/v2/integration/internal/portutil"
+	"github.com/trickstercache/trickster/v2/integration/promstub"
 )
 
 // TestALBMatrix crosses the ALB mechanism, pool size, fraction of pool
@@ -380,24 +381,10 @@ func mechVariants(mech string) []string {
 func writeMatrixConfig(t *testing.T, c matrixCell, stubs []*flappingStub) string {
 	t.Helper()
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "frontend:\n  listen_port: %d\n", c.frontPort)
-	fmt.Fprintf(&sb, "metrics:\n  listen_port: %d\n", c.metricsPort)
-	fmt.Fprintf(&sb, "mgmt:\n  listen_port: %d\n", c.mgmtPort)
-	sb.WriteString("logging:\n  log_level: error\n")
-	sb.WriteString("caches:\n  mem1:\n    provider: memory\n")
+	sb.WriteString(promstub.Preamble(c.frontPort, c.metricsPort, c.mgmtPort))
 	sb.WriteString("backends:\n")
 	for i, s := range stubs {
-		fmt.Fprintf(&sb, "  prom%d:\n", i)
-		sb.WriteString("    provider: prometheus\n")
-		fmt.Fprintf(&sb, "    origin_url: %s\n", s.URL())
-		sb.WriteString("    cache_name: mem1\n")
-		sb.WriteString("    healthcheck:\n")
-		sb.WriteString("      path: /api/v1/status/buildinfo\n")
-		sb.WriteString("      query: \"\"\n")
-		sb.WriteString("      interval: 100ms\n")
-		sb.WriteString("      timeout: 500ms\n")
-		sb.WriteString("      failure_threshold: 1\n")
-		sb.WriteString("      recovery_threshold: 1\n")
+		sb.WriteString(promstub.BackendStanza(fmt.Sprintf("prom%d", i), s.URL()))
 	}
 	fmt.Fprintf(&sb, "  alb-%s:\n", c.mech)
 	sb.WriteString("    provider: alb\n")
