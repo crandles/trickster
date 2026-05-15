@@ -74,6 +74,42 @@ func TestWaitForFirstMatchingWinsAndCancelsLosers(t *testing.T) {
 	require.Equal(t, int32(2), slowCancelled.Load(), "both slow slots must observe ctx cancel")
 }
 
+// TestWaitForFirstReturnsBeforeLoserDrains asserts that a winner is returned
+// without waiting for a non-winning handler that ignores cancellation.
+func TestWaitForFirstReturnsBeforeLoserDrains(t *testing.T) {
+	const loserDelay = 250 * time.Millisecond
+
+	var loserDone atomic.Bool
+	loser := func(_ http.ResponseWriter, _ *http.Request) {
+		time.Sleep(loserDelay)
+		loserDone.Store(true)
+	}
+	winner := func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("winner"))
+	}
+
+	t0, _ := albpool.Target(http.HandlerFunc(loser))
+	t1, _ := albpool.Target(http.HandlerFunc(winner))
+	targets := pool.Targets{t0, t1}
+	parent := albpool.NewParentGET(t)
+
+	matches202 := func(r *Result) bool {
+		return r.Capture.StatusCode() == http.StatusAccepted
+	}
+
+	start := time.Now()
+	idx, results, err := WaitForFirst(context.Background(), parent, targets, Config{Mechanism: "test-waitforfirst"}, matches202)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, idx, "winner should be slot 1")
+	require.NotNil(t, results[1].Capture)
+	require.Equal(t, "winner", string(results[1].Capture.Body()))
+	require.Less(t, elapsed, loserDelay/2, "WaitForFirst must not wait for a loser that ignores cancellation")
+	require.Eventually(t, loserDone.Load, 2*loserDelay, 10*time.Millisecond, "loser did not finish")
+}
+
 // TestWaitForFirstNoMatchReturnsMinusOne asserts that when predicate never
 // matches, WaitForFirst returns winnerIdx = -1 and all results are populated.
 func TestWaitForFirstNoMatchReturnsMinusOne(t *testing.T) {
@@ -106,27 +142,31 @@ func TestWaitForFirstTruncatedNotEligible(t *testing.T) {
 	big := bytes.Repeat([]byte("x"), 1024)
 
 	intactBody := "ok"
+	var sawTruncatedCandidate atomic.Bool
 	t0, _ := albpool.Target(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write(big)
 	}))
 	t1, _ := albpool.Target(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(20 * time.Millisecond)
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(intactBody))
 	}))
 	targets := pool.Targets{t0, t1}
 	parent := albpool.NewParentGET(t)
 
 	pred := func(r *Result) bool {
-		return r.Capture.StatusCode() == http.StatusOK
+		if r.Capture.StatusCode() == http.StatusCreated {
+			sawTruncatedCandidate.Store(true)
+		}
+		return r.Capture.StatusCode() < 300
 	}
 
 	idx, results, err := WaitForFirst(context.Background(), parent, targets, Config{Mechanism: "test-waitforfirst-trunc", MaxCaptureBytes: maxBytes}, pred)
 	require.NoError(t, err)
 	require.Equal(t, 1, idx, "intact slot must win; truncated slot must not be eligible")
 	require.Equal(t, intactBody, string(results[1].Capture.Body()))
-	require.True(t, results[0].Failed, "truncated slot must be marked Failed")
+	require.False(t, sawTruncatedCandidate.Load(), "truncated slot must not be offered to predicate")
 }
 
 // TestWaitForFirstNilPredicateBehavesLikeAll asserts that passing a nil

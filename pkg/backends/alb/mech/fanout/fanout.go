@@ -23,13 +23,14 @@
 // Mechanisms that wait for all members and decide afterwards (NLM, TSM) call
 // All. Mechanisms that race for a first-qualifying response (FR/FGR) call
 // WaitForFirst with a winner predicate; WaitForFirst cancels remaining work
-// the moment a winner is claimed and still drains every spawned goroutine
-// before returning, so no leaks.
+// the moment a winner is claimed and returns that winner without waiting for
+// slow losers to drain.
 package fanout
 
 import (
 	"context"
 	"net/http"
+	"sync"
 	"sync/atomic"
 
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/mech"
@@ -175,16 +176,16 @@ func All(ctx context.Context, parent *http.Request, targets pool.Targets, cfg Co
 
 // WaitForFirst scatters parent to every target and returns the first slot
 // whose Result satisfies predicate. Semantics are "first matching predicate,
-// cancel rest, drain all", which is distinct from errgroup-style "first to
-// finish or error": every spawned goroutine still runs to completion (under
-// a cancelled context) before WaitForFirst returns, so callers cannot
-// observe goroutine leaks. Truncated captures are never eligible (they are
-// disqualified inside the primitive).
+// cancel rest, return the winner", which is distinct from errgroup-style
+// "first to finish or error". Truncated captures are never eligible (they
+// are disqualified inside the primitive).
 //
 // winnerIdx is the slot index of the winning result, or -1 if no result
-// satisfied predicate. results is slot-ordered exactly like All's return:
-// callers can iterate it to implement their own fallback policy (e.g. FR's
-// "first non-failed slot" pick when no member qualified).
+// satisfied predicate. When winnerIdx == -1, results is fully gathered and
+// slot-ordered exactly like All's return: callers can iterate it to implement
+// their own fallback policy (e.g. FR's "first non-failed slot" pick when no
+// member qualified). When winnerIdx >= 0, only results[winnerIdx] is
+// guaranteed to be complete when WaitForFirst returns.
 //
 // Other than the early-cancel behaviour, WaitForFirst shares its clone,
 // capture, resource, recovery, and metric machinery with All.
@@ -197,9 +198,14 @@ func WaitForFirst(ctx context.Context, parent *http.Request, targets pool.Target
 
 	raceCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	gathered := make([]Result, len(targets))
 
-	var claimed atomic.Int64
-	claimed.Store(-1)
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	claimed := -1
+	scatterDone := false
+	var scatterErr error
+	var winnerResult Result
 
 	onComplete := func(i int, r *Result) {
 		if r.Failed || r.Capture == nil {
@@ -208,14 +214,50 @@ func WaitForFirst(ctx context.Context, parent *http.Request, targets pool.Target
 		if !predicate(r) {
 			return
 		}
-		if claimed.CompareAndSwap(-1, int64(i)) {
+		mu.Lock()
+		if claimed == -1 {
+			claimed = i
+			winnerResult = *r
 			cancel()
+			cond.Broadcast()
 		}
+		mu.Unlock()
 	}
 
-	results, err = scatter(raceCtx, parent, targets, cfg, onComplete)
-	winnerIdx = int(claimed.Load())
-	return winnerIdx, results, err
+	go func() {
+		_, err := scatterInto(raceCtx, parent, targets, cfg, onComplete, gathered)
+		mu.Lock()
+		scatterErr = err
+		scatterDone = true
+		cond.Broadcast()
+		mu.Unlock()
+	}()
+
+	stopWake := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		cond.Broadcast()
+		mu.Unlock()
+	})
+	defer stopWake()
+
+	mu.Lock()
+	defer mu.Unlock()
+	for {
+		winnerIdx = claimed
+		if winnerIdx >= 0 {
+			results = make([]Result, len(targets))
+			results[winnerIdx] = winnerResult
+			return winnerIdx, results, nil
+		}
+		if scatterDone {
+			return -1, gathered, scatterErr
+		}
+		if err := ctx.Err(); err != nil {
+			cancel()
+			return -1, make([]Result, len(targets)), err
+		}
+		cond.Wait()
+	}
 }
 
 // scatter is the shared implementation behind All and WaitForFirst. perSlot,
@@ -224,9 +266,13 @@ func WaitForFirst(ctx context.Context, parent *http.Request, targets pool.Target
 // the race-pick hook: WaitForFirst uses it to CAS-claim the winner slot.
 // perSlot must be safe for concurrent invocation.
 func scatter(ctx context.Context, parent *http.Request, targets pool.Targets, cfg Config, perSlot func(idx int, r *Result)) ([]Result, error) {
+	results := make([]Result, len(targets))
+	return scatterInto(ctx, parent, targets, cfg, perSlot, results)
+}
+
+func scatterInto(ctx context.Context, parent *http.Request, targets pool.Targets, cfg Config, perSlot func(idx int, r *Result), results []Result) ([]Result, error) {
 	metrics.ALBFanoutAttempts.WithLabelValues(cfg.Mechanism, cfg.Variant).Inc()
 	l := len(targets)
-	results := make([]Result, l)
 	if l == 0 {
 		return results, nil
 	}
