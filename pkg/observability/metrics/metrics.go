@@ -377,9 +377,9 @@ var (
 			Namespace: metricNamespace,
 			Subsystem: healthSubsystem,
 			Name:      "probe_panic_recovered_total",
-			Help:      "Count of recovered panics in the per-target health-probe ticker, by target.",
+			Help:      "Count of recovered panics in the per-target health-probe ticker, by backend.",
 		},
-		[]string{"target"},
+		[]string{"backend_name"},
 	)
 
 	// HealthcheckProbeLatency records wall-clock duration of each per-target
@@ -391,10 +391,10 @@ var (
 			Namespace: metricNamespace,
 			Subsystem: healthSubsystem,
 			Name:      "probe_latency_seconds",
-			Help:      "Latency of per-target health-check probes, in seconds, by target.",
+			Help:      "Latency of per-target health-check probes, in seconds, by backend.",
 			Buckets:   []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
 		},
-		[]string{"target"},
+		[]string{"backend_name"},
 	)
 
 	// ProxyEnginesPanicRecovered counts recovered panics in fire-and-forget
@@ -449,9 +449,9 @@ var (
 			Namespace: metricNamespace,
 			Subsystem: healthSubsystem,
 			Name:      "status_notify_panic_recovered_total",
-			Help:      "Count of recovered panics while notifying a healthcheck Status subscriber, by target.",
+			Help:      "Count of recovered panics while notifying a healthcheck Status subscriber, by backend.",
 		},
-		[]string{"target"},
+		[]string{"backend_name"},
 	)
 )
 
