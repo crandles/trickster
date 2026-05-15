@@ -108,12 +108,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if u.ToCredential != "" {
 				cred = string(u.ToCredential)
 			}
-			// strip the inbound Authorization before writing the new credential,
-			// since Sanitize unconditionally clears the header
-			auth.Sanitize(r)
-			if err := auth.SetCredentials(r, username, cred); err != nil {
-				h.handleDefault(w, r)
-				return
+			// Don't write empty creds: callers using AuthResult-only auth
+			// (SSO, etc.) have cred == "" with nothing to fall back on.
+			// SetCredentials(r, user, "") emits Basic auth with an empty
+			// password and collapses every such user into one cache key.
+			if cred != "" {
+				auth.Sanitize(r)
+				if err := auth.SetCredentials(r, username, cred); err != nil {
+					h.handleDefault(w, r)
+					return
+				}
 			}
 		}
 		// this passes the request to a user-specific route handler, if set
