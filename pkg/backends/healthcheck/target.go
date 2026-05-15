@@ -253,6 +253,10 @@ func (t *target) probe(ctx context.Context) {
 	var detail string
 	switch {
 	case err != nil, resp == nil:
+		// CheckRedirect returns a non-nil resp alongside its error; close to release the conn.
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
 		detail = fmt.Sprintf("error probing target: %v", err)
 		t.status.SetDetail(detail)
 		errCnt = int(t.failConsecutiveCnt.Add(1))

@@ -170,6 +170,11 @@ func StatusHandler(now func() time.Time, hc healthcheck.HealthChecker, backends 
 			"stack": string(stack),
 		})
 		metrics.HealthHandlerPanicRecovered.Inc()
+		// Seed an empty detail so handler reads after a first-cycle panic
+		// don't nil-deref on detail.lastModified.
+		if hd.detail.Load() == nil {
+			hd.detail.Store(&detail{})
+		}
 		// Unblock the wait below so a panic on the first builder cycle
 		// doesn't leave the handler hung forever.
 		select {
