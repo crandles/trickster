@@ -28,7 +28,6 @@ import (
 
 	"github.com/trickstercache/trickster/v2/pkg/appinfo"
 	"github.com/trickstercache/trickster/v2/pkg/appinfo/usage"
-	"github.com/trickstercache/trickster/v2/pkg/backends"
 	"github.com/trickstercache/trickster/v2/pkg/config/reload"
 	"github.com/trickstercache/trickster/v2/pkg/config/validate"
 	"github.com/trickstercache/trickster/v2/pkg/daemon/instance"
@@ -39,6 +38,7 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/observability/logging/logger"
 	"github.com/trickstercache/trickster/v2/pkg/observability/metrics"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/listener"
+	"github.com/trickstercache/trickster/v2/pkg/util/safego"
 )
 
 var mtx sync.Mutex
@@ -211,12 +211,12 @@ func Hup(si *instance.ServerInstance, source string, args ...string) (bool, erro
 		if newConf.MgmtConfig != nil && newConf.MgmtConfig.ReloadDrainTimeout > 0 {
 			drainTimeout = newConf.MgmtConfig.ReloadDrainTimeout
 		}
-		go func() {
+		safego.Go(reloadGoroutinePanic("oldListeners.Shutdown", source), func() {
 			if err := oldListeners.Shutdown(drainTimeout); err != nil {
 				logger.Warn("error shutting down old listeners",
 					logging.Pairs{"error": err.Error(), "source": source})
 			}
-		}()
+		})
 	}
 
 	if oldClients != nil {
@@ -228,10 +228,10 @@ func Hup(si *instance.ServerInstance, source string, args ...string) (bool, erro
 		if newConf.MgmtConfig != nil && newConf.MgmtConfig.ReloadDrainTimeout > 0 {
 			drainTimeout = newConf.MgmtConfig.ReloadDrainTimeout
 		}
-		go func(b backends.Backends, d time.Duration) {
-			time.Sleep(d)
-			b.CloseIdleConnections()
-		}(oldClients, drainTimeout)
+		safego.Go(reloadGoroutinePanic("oldClients.CloseIdleConnections", source), func() {
+			time.Sleep(drainTimeout)
+			oldClients.CloseIdleConnections()
+		})
 	}
 
 	metrics.ReloadSuccessesTotal.Inc()
@@ -241,4 +241,15 @@ func Hup(si *instance.ServerInstance, source string, args ...string) (bool, erro
 
 	logger.Info(reload.ConfigReloadedText, logging.Pairs{"source": source})
 	return true, nil
+}
+
+func reloadGoroutinePanic(site, source string) safego.PanicHandler {
+	return func(r any, stack []byte) {
+		logger.Error("reload background goroutine panic", logging.Pairs{
+			"site":   site,
+			"source": source,
+			"panic":  r,
+			"stack":  string(stack),
+		})
+	}
 }

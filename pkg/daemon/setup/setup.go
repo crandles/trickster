@@ -53,6 +53,7 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/proxy/router"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/router/lm"
 	"github.com/trickstercache/trickster/v2/pkg/routing"
+	"github.com/trickstercache/trickster/v2/pkg/util/safego"
 )
 
 // mtx guards the config loading and validation process,
@@ -335,12 +336,19 @@ func closeOldCache(name string, w cache.Cache, drainTimeout time.Duration) {
 	if m, ok := w.(*manager.Manager); ok {
 		m.SetCloseDrainTimeout(drainTimeout)
 	}
-	go func() {
+	safego.Go(func(r any, stack []byte) {
+		logger.Error("reload background goroutine panic", logging.Pairs{
+			"site":  "closeOldCache",
+			"cache": name,
+			"panic": r,
+			"stack": string(stack),
+		})
+	}, func() {
 		if err := w.Close(); err != nil {
 			logger.Warn("error closing old cache during reload",
 				logging.Pairs{"cache": name, "error": err.Error()})
 		}
-	}()
+	})
 }
 
 func initLogger(c *config.Config) logging.Logger {
