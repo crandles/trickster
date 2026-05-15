@@ -108,7 +108,8 @@ func runChaosCell(t *testing.T, mech, behavior string, chaosData http.HandlerFun
 	}
 
 	const reqs = 5
-	var ok, nonOK int
+	const healthyBodyLen = 100 // promVectorBody is ~140 bytes; below this implies a truncated chaos win
+	var ok, nonOK, short int
 	for i := range reqs {
 		q := fmt.Sprintf("up + 0*%d", time.Now().UnixNano()+int64(i))
 		u := fmt.Sprintf("http://127.0.0.1:%d/alb-%s/api/v1/query?query=%s",
@@ -119,23 +120,35 @@ func runChaosCell(t *testing.T, mech, behavior string, chaosData http.HandlerFun
 			nonOK++
 			continue
 		}
-		_, _ = io.Copy(io.Discard, resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
 			ok++
+			if len(body) < healthyBodyLen {
+				short++
+				t.Logf("%s/%s: short 200 body (%d bytes): %q",
+					mech, behavior, len(body), string(body))
+			}
 		} else {
 			nonOK++
 		}
 	}
-	t.Logf("%s/%s: ok=%d nonOK=%d", mech, behavior, ok, nonOK)
+	t.Logf("%s/%s: ok=%d nonOK=%d short=%d", mech, behavior, ok, nonOK, short)
 
-	// The bar today is: process is still running, every request got a
-	// terminal response (2xx or 5xx), and trickster startup succeeded against
-	// the chaos-flavored config. Stricter "chaos never wins" assertions wait
-	// on the PR 3 adjacent-bug fixes (CL/short-read in proxy_request.go).
+	// Every request must get a terminal response (process is still running).
 	assert.Equalf(t, reqs, ok+nonOK,
 		"%s/%s: %d/%d requests dropped (transport-level failure)",
 		mech, behavior, reqs-(ok+nonOK), reqs)
+	// The truncate_stale_cl chaos stub declares Content-Length: 4096 and
+	// writes 16 bytes. With the fanout short-read disqualifier wired up
+	// (pkg/backends/alb/mech/fanout/fanout.go), FR/NLM must reject the
+	// chaos slot and serve the healthy member's full body, not the
+	// truncated 16-byte body.
+	if behavior == "truncate_stale_cl" {
+		assert.Zerof(t, short,
+			"%s/%s: served %d short bodies; chaos stub should be disqualified by short-read check",
+			mech, behavior, short)
+	}
 }
 
 // pathAwareStub serves /api/v1/status/buildinfo with a fixed healthy 200
