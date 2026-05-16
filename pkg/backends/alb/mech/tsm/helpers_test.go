@@ -192,23 +192,28 @@ func TestMergeMultiValuedHeaders(t *testing.T) {
 		wantWinnerCleared bool
 	}{
 		{
-			name: "preserves Set-Cookie across results and clears winner copy",
+			name: "forwards winner Set-Cookie and clears winner copy",
 			results: []gatherResult{
-				{header: http.Header{headers.NameSetCookie: []string{"a=1", "b=2"}}},
-				{header: http.Header{headers.NameSetCookie: []string{"c=3"}}},
+				{header: http.Header{headers.NameSetCookie: []string{"loser1=a"}}},
+				{header: http.Header{headers.NameSetCookie: []string{"loser2=b"}}},
 			},
-			winner:            http.Header{headers.NameSetCookie: []string{"winner=ignored"}},
-			wantSetCookies:    []string{"a=1", "b=2", "c=3"},
+			winner:            http.Header{headers.NameSetCookie: []string{"winner=v1", "winner=v2"}},
+			wantSetCookies:    []string{"winner=v1", "winner=v2"},
 			wantWinnerCleared: true,
 		},
 		{
-			name: "skips nil header entries",
+			name: "drops all Set-Cookies when winner has none",
 			results: []gatherResult{
-				{header: nil},
-				{header: http.Header{headers.NameSetCookie: []string{"only=1"}}},
+				{header: http.Header{headers.NameSetCookie: []string{"loser=1"}}},
 			},
+			winner:         http.Header{},
+			wantSetCookies: nil,
+		},
+		{
+			name:           "nil winner drops all",
+			results:        []gatherResult{{header: http.Header{headers.NameSetCookie: []string{"loser=1"}}}},
 			winner:         nil,
-			wantSetCookies: []string{"only=1"},
+			wantSetCookies: nil,
 		},
 	}
 

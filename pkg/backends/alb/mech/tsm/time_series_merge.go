@@ -601,26 +601,23 @@ func (h *handler) serveStandard(
 	}
 }
 
-// mergeMultiValuedHeaders appends every member's Set-Cookie values onto dst
+// mergeMultiValuedHeaders forwards Set-Cookie from the winning shard only
 // and clears Set-Cookie on winnerHeaders so the subsequent headers.Merge
-// (which uses Set semantics) doesn't collapse them. RFC 6265 allows multiple
-// Set-Cookie response headers; Warning (RFC 7234) is similar but no current
-// backend sets it.
+// (which uses Set semantics) doesn't collapse multi-valued cookies. RFC 6265
+// allows multiple Set-Cookie response headers per response.
 //
-// Set-Cookie is aggregated across every shard, so deploying TSM across a
-// tenant boundary will mix session cookies between tenants.
-func mergeMultiValuedHeaders(dst http.Header, results []gatherResult, winnerHeaders http.Header) {
-	for _, res := range results {
-		if res.header == nil {
-			continue
-		}
-		for _, v := range res.header.Values(headers.NameSetCookie) {
-			dst.Add(headers.NameSetCookie, v)
-		}
+// Set-Cookie is winner-only (not aggregated across shards) so a TSM ALB
+// placed in front of tenant-scoped upstreams doesn't mix session cookies
+// between tenants. The results slice is retained in the signature for
+// future multi-valued headers that genuinely should aggregate.
+func mergeMultiValuedHeaders(dst http.Header, _ []gatherResult, winnerHeaders http.Header) {
+	if winnerHeaders == nil {
+		return
 	}
-	if winnerHeaders != nil {
-		winnerHeaders.Del(headers.NameSetCookie)
+	for _, v := range winnerHeaders.Values(headers.NameSetCookie) {
+		dst.Add(headers.NameSetCookie, v)
 	}
+	winnerHeaders.Del(headers.NameSetCookie)
 }
 
 // pruneUnpairedWeightedAvgSeries drops series from sumDS that have no
