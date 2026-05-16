@@ -55,12 +55,13 @@ func TestALBMatrix(t *testing.T) {
 
 	cases := buildMatrixCases()
 	for _, c := range cases {
-		// Reserve per-cell so the close-to-bind race window is bounded to
-		// one cell's setup rather than the full matrix duration. CI sees
-		// EADDRINUSE if 200+ closed ephemeral ports are held idle while
-		// other processes recycle them.
-		ports := portutil.Reserve(t, 3)
+		// Reserve per-cell with a deferred release so the listeners stay
+		// open through config write + most of cell setup; trickster binds
+		// the same ports immediately after release, minimizing the
+		// close-to-bind race window.
+		ports, release := portutil.Reserve(t, 3)
 		c.frontPort, c.metricsPort, c.mgmtPort = ports[0], ports[1], ports[2]
+		c.releasePorts = release
 		t.Run(c.name(), func(t *testing.T) {
 			runMatrixCell(t, c)
 		})
@@ -75,6 +76,10 @@ type matrixCell struct {
 	frontPort    int
 	metricsPort  int
 	mgmtPort     int
+	// releasePorts closes the reserved-port listeners. The cell calls it
+	// immediately before startTrickster so the close-to-bind window is a
+	// single function call wide.
+	releasePorts func()
 }
 
 func (c matrixCell) name() string {
@@ -213,6 +218,9 @@ func runMatrixCell(t *testing.T, c matrixCell) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	if c.releasePorts != nil {
+		c.releasePorts()
+	}
 	go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
 	waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", c.metricsPort))
 

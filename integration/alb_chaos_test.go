@@ -58,17 +58,16 @@ func TestALBChaosBehaviors(t *testing.T) {
 	}
 
 	for _, c := range cells {
-		// Reserve per-cell to bound the close-to-bind race window.
-		ports := portutil.Reserve(t, 3)
+		ports, release := portutil.Reserve(t, 3)
 		front, metrics, mgmt := ports[0], ports[1], ports[2]
 		t.Run(fmt.Sprintf("%s_%s", c.mech, c.behavior), func(t *testing.T) {
-			runChaosCell(t, c.mech, c.behavior, c.fn, front, metrics, mgmt)
+			runChaosCell(t, c.mech, c.behavior, c.fn, front, metrics, mgmt, release)
 		})
 	}
 }
 
 func runChaosCell(t *testing.T, mech, behavior string, chaosData http.HandlerFunc,
-	frontPort, metricsPort, mgmtPort int,
+	frontPort, metricsPort, mgmtPort int, releasePorts func(),
 ) {
 	t.Helper()
 
@@ -80,6 +79,9 @@ func runChaosCell(t *testing.T, mech, behavior string, chaosData http.HandlerFun
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	if releasePorts != nil {
+		releasePorts()
+	}
 	go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
 	waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
 

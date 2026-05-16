@@ -17,14 +17,20 @@ import (
 	"testing"
 )
 
-// Reserve binds n ephemeral TCP ports, releases them, and returns the port
-// numbers in the order acquired. There is a small race window between
-// release and trickster's bind, but for test-suite use it eliminates the
-// deterministic-port-collision class of failure.
-func Reserve(t testing.TB, n int) []int {
+// Reserve binds n ephemeral TCP ports and returns the port numbers plus a
+// release function. The listeners stay open until the caller invokes release,
+// so the caller can write the ports into a config template and only release
+// immediately before whatever consumer (e.g. trickster) needs to bind them.
+// This minimizes the close-to-bind window where another process may grab the
+// freed port out from under the consumer.
+//
+// The caller MUST call release() exactly once, just before passing the ports
+// to the consumer. The returned function is idempotent and safe to call from
+// t.Cleanup as a backstop.
+func Reserve(t testing.TB, n int) (ports []int, release func()) {
 	t.Helper()
 	ls := make([]*net.TCPListener, n)
-	out := make([]int, n)
+	ports = make([]int, n)
 	for i := range n {
 		l, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
@@ -34,10 +40,18 @@ func Reserve(t testing.TB, n int) []int {
 			t.Fatalf("listen :0: %v", err)
 		}
 		ls[i] = l
-		out[i] = l.Addr().(*net.TCPAddr).Port
+		ports[i] = l.Addr().(*net.TCPAddr).Port
 	}
-	for _, l := range ls {
-		l.Close()
+	closed := false
+	release = func() {
+		if closed {
+			return
+		}
+		closed = true
+		for _, l := range ls {
+			l.Close()
+		}
 	}
-	return out
+	t.Cleanup(release)
+	return ports, release
 }
