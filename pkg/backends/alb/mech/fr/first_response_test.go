@@ -216,9 +216,17 @@ func TestFGRFallbackEmits502WhenNoMemberQualifies(t *testing.T) {
 // TestHandleFirstResponseContextCancel verifies that cancelling the request
 // context while a backend is responding does not race on the ResponseWriter.
 // The raceWriter makes the race detector catch any write-after-return.
+//
+// Handlers observe the request context so cancelled iterations drain
+// promptly: WaitForFirst returns on winner-claim without draining losers, so
+// uncooperative handlers would orphan scatter goroutines past goleak's window.
 func TestHandleFirstResponseContextCancel(t *testing.T) {
-	slow := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(20 * time.Millisecond)
+	slow := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(20 * time.Millisecond):
+		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
@@ -256,8 +264,12 @@ func TestHandleFirstResponseContextCancel(t *testing.T) {
 }
 
 func TestHandleFirstResponseContextCancel_50Backends(t *testing.T) {
-	slow := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(20 * time.Millisecond)
+	slow := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(20 * time.Millisecond):
+		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
