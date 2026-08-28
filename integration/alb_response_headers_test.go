@@ -31,13 +31,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/trickstercache/trickster/v2/integration/internal/portutil"
+	"github.com/trickstercache/trickster/v2/integration/promstub"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-const respHdrMatrixTmpl = `{"status":"success","data":{"resultType":"matrix","result":[` +
-	`{"metric":{"job":"prometheus"},"values":[%s]}` +
-	`]}}`
+var respHdrMatrixTmpl = func() string {
+	b, err := albTestdataFS.ReadFile("testdata/alb_response_headers/matrix.json.tmpl")
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}()
 
 func mkRespHdrMatrix(start, end, step int64, val string) string {
 	var b strings.Builder
@@ -57,12 +64,11 @@ func mkRespHdrMatrix(start, end, step int64, val string) string {
 func TestALBResponseHeadersTSMSetCookie(t *testing.T) {
 	mkOrigin := func(val, cookie string) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			if r.URL.Path == "/api/v1/status/buildinfo" {
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+			if r.URL.Path == promstub.BuildInfoPath {
+				promstub.WriteBuildInfo(w)
 				return
 			}
+			w.Header().Set("Content-Type", "application/json")
 			_ = r.ParseForm()
 			start, _ := parseInt(r.Form.Get("start"))
 			end, _ := parseInt(r.Form.Get("end"))
@@ -81,60 +87,18 @@ func TestALBResponseHeadersTSMSetCookie(t *testing.T) {
 	t.Cleanup(upA.Close)
 	t.Cleanup(upB.Close)
 
-	frontPort := 19110
-	metricsPort := 19111
-	mgmtPort := 19112
+	ports, release := portutil.Reserve(t, 3)
+	frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
 
-	yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-backends:
-  prom-a:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-b:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-tsm-cookies:
-    provider: alb
-    alb:
-      mechanism: tsm
-      output_format: prometheus
-      pool:
-        - prom-a
-        - prom-b
-`, frontPort, metricsPort, mgmtPort, upA.URL, upB.URL)
+	yaml := fmt.Sprintf(albTestdata(t, "alb_response_headers/cookies.yaml.tmpl"),
+		frontPort, metricsPort, mgmtPort, upA.URL, upB.URL)
 
 	cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	release()
 	go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
 	waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
 
@@ -150,9 +114,9 @@ backends:
 	u := fmt.Sprintf("http://127.0.0.1:%d/alb-tsm-cookies/api/v1/query_range?%s",
 		frontPort, params.Encode())
 
-	// retry until both backends are healthy and the merged response carries
-	// both members' Set-Cookie values; a 200 alone can be served by a single
-	// live member while the other healthcheck is still warming up
+	// Set-Cookie is winner-only (cross-tenant leak prevention): exactly one of
+	// (a=1, b=2) appears in the merged response, never both. Retry until
+	// trickster is healthy and at least one cookie shows.
 	var cookies []string
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
 		client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
@@ -174,11 +138,16 @@ backends:
 				hasB = true
 			}
 		}
-		if assert.Truef(c, hasA && hasB,
-			"both members' Set-Cookie values should survive TSM merge; got %v", got) {
-			cookies = got
+		if !assert.Truef(c, hasA || hasB,
+			"merged response must carry the winner's Set-Cookie; got %v", got) {
+			return
 		}
-	}, 10*time.Second, 200*time.Millisecond, "alb-tsm-cookies never returned both Set-Cookie values")
+		if !assert.Falsef(c, hasA && hasB,
+			"only winner's Set-Cookie should survive TSM merge (cross-tenant leak prevention); got %v", got) {
+			return
+		}
+		cookies = got
+	}, 10*time.Second, 200*time.Millisecond, "alb-tsm-cookies never returned winner Set-Cookie")
 
 	t.Logf("Set-Cookie values observed in merged TSM response: %v", cookies)
 }
@@ -195,12 +164,11 @@ func TestALBResponseHeadersTSMContentEncoding(t *testing.T) {
 
 	mkGzipOrigin := func(val string) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			if r.URL.Path == "/api/v1/status/buildinfo" {
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+			if r.URL.Path == promstub.BuildInfoPath {
+				promstub.WriteBuildInfo(w)
 				return
 			}
+			w.Header().Set("Content-Type", "application/json")
 			_ = r.ParseForm()
 			start, _ := parseInt(r.Form.Get("start"))
 			end, _ := parseInt(r.Form.Get("end"))
@@ -216,12 +184,11 @@ func TestALBResponseHeadersTSMContentEncoding(t *testing.T) {
 	}
 	mkPlainOrigin := func(val string) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			if r.URL.Path == "/api/v1/status/buildinfo" {
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+			if r.URL.Path == promstub.BuildInfoPath {
+				promstub.WriteBuildInfo(w)
 				return
 			}
+			w.Header().Set("Content-Type", "application/json")
 			_ = r.ParseForm()
 			start, _ := parseInt(r.Form.Get("start"))
 			end, _ := parseInt(r.Form.Get("end"))
@@ -239,60 +206,18 @@ func TestALBResponseHeadersTSMContentEncoding(t *testing.T) {
 	t.Cleanup(upA.Close)
 	t.Cleanup(upB.Close)
 
-	frontPort := 19120
-	metricsPort := 19121
-	mgmtPort := 19122
+	ports, release := portutil.Reserve(t, 3)
+	frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
 
-	yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-backends:
-  prom-a:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-b:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-tsm-encoding:
-    provider: alb
-    alb:
-      mechanism: tsm
-      output_format: prometheus
-      pool:
-        - prom-a
-        - prom-b
-`, frontPort, metricsPort, mgmtPort, upA.URL, upB.URL)
+	yaml := fmt.Sprintf(albTestdata(t, "alb_response_headers/encoding.yaml.tmpl"),
+		frontPort, metricsPort, mgmtPort, upA.URL, upB.URL)
 
 	cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	release()
 	go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
 	waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
 

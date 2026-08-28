@@ -31,28 +31,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/trickstercache/trickster/v2/integration/internal/portutil"
+	"github.com/trickstercache/trickster/v2/integration/promstub"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestALBCache(t *testing.T) {
 	t.Run("C1 shared cache_key_prefix collides across pool members", func(t *testing.T) {
-		const respTmpl = `{"status":"success","data":{"resultType":"vector","result":[` +
-			`{"metric":{"__name__":"up","job":"%s"},"value":[1700000000,"%s"]}]}}`
+		respTmpl := albTestdata(t, "alb_cache/c1_vector.json.tmpl")
 
 		var aHits, bHits atomic.Int64
 		mk := func(label, val string, hits *atomic.Int64) *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				switch r.URL.Path {
-				case "/api/v1/status/buildinfo":
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
-				default:
-					hits.Add(1)
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprintf(w, respTmpl, label, val)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
+					return
 				}
+				w.Header().Set("Content-Type", "application/json")
+				hits.Add(1)
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintf(w, respTmpl, label, val)
 			}))
 		}
 		upstreamA := mk("a", "1", &aHits)
@@ -60,61 +60,18 @@ func TestALBCache(t *testing.T) {
 		upstreamB := mk("b", "2", &bHits)
 		t.Cleanup(upstreamB.Close)
 
-		frontPort := 18900
-		metricsPort := 18901
-		mgmtPort := 18902
+		ports, release := portutil.Reserve(t, 3)
+		frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
 
-		yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-backends:
-  prom-A:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    cache_key_prefix: shared
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-B:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    cache_key_prefix: shared
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-shared-cache:
-    provider: alb
-    alb:
-      mechanism: rr
-      pool:
-        - prom-A
-        - prom-B
-`, frontPort, metricsPort, mgmtPort, upstreamA.URL, upstreamB.URL)
+		yaml := fmt.Sprintf(albTestdata(t, "alb_cache/c1.yaml.tmpl"),
+			frontPort, metricsPort, mgmtPort, upstreamA.URL, upstreamB.URL)
 
 		cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 		require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
 
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
+		release()
 		go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
 		waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
 
@@ -182,9 +139,7 @@ backends:
 	})
 
 	t.Run("C2 tsm tolerates one member with unsupported content-encoding", func(t *testing.T) {
-		const promRange = `{"status":"success","data":{"resultType":"matrix","result":[` +
-			`{"metric":{"__name__":"up","job":"prometheus"},"values":[%s]}` +
-			`]}}`
+		promRange := albTestdata(t, "alb_cache/c2_prom_range.json.tmpl")
 
 		mkRange := func(start, end, step int64) string {
 			var b strings.Builder
@@ -201,12 +156,11 @@ backends:
 
 		makeOK := func() *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				if r.URL.Path == "/api/v1/status/buildinfo" {
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
 					return
 				}
+				w.Header().Set("Content-Type", "application/json")
 				_ = r.ParseForm()
 				start, _ := parseInt(r.Form.Get("start"))
 				end, _ := parseInt(r.Form.Get("end"))
@@ -221,10 +175,8 @@ backends:
 		var m2QueryHits atomic.Int64
 		makeBadEncoding := func(qhits *atomic.Int64) *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/api/v1/status/buildinfo" {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
 					return
 				}
 				qhits.Add(1)
@@ -242,72 +194,18 @@ backends:
 		m2 := makeBadEncoding(&m2QueryHits)
 		t.Cleanup(m2.Close)
 
-		frontPort := 18910
-		metricsPort := 18911
-		mgmtPort := 18912
+		ports, release := portutil.Reserve(t, 3)
+		frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
 
-		yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-backends:
-  prom-0:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-1:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-2:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-tsm-encoding:
-    provider: alb
-    alb:
-      mechanism: tsm
-      output_format: prometheus
-      pool:
-        - prom-0
-        - prom-1
-        - prom-2
-`, frontPort, metricsPort, mgmtPort, m0.URL, m1.URL, m2.URL)
+		yaml := fmt.Sprintf(albTestdata(t, "alb_cache/c2.yaml.tmpl"),
+			frontPort, metricsPort, mgmtPort, m0.URL, m1.URL, m2.URL)
 
 		cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 		require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
 
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
+		release()
 		go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
 		waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
 
@@ -378,15 +276,15 @@ backends:
 	})
 
 	t.Run("V3 tsm phit marker for mixed cache hit/miss across members", func(t *testing.T) {
+		matrixTmpl := albTestdata(t, "alb_cache/v3_matrix.json.tmpl")
 		var m1Hits, m2Hits atomic.Int64
 		mk := func(hits *atomic.Int64) *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				if r.URL.Path == "/api/v1/status/buildinfo" {
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
 					return
 				}
+				w.Header().Set("Content-Type", "application/json")
 				_ = r.ParseForm()
 				start, _ := parseInt(r.Form.Get("start"))
 				end, _ := parseInt(r.Form.Get("end"))
@@ -405,10 +303,7 @@ backends:
 					fmt.Fprintf(&b, `[%d,"1"]`, ts)
 				}
 				w.WriteHeader(http.StatusOK)
-				fmt.Fprintf(w,
-					`{"status":"success","data":{"resultType":"matrix","result":[`+
-						`{"metric":{"__name__":"up","job":"prometheus"},"values":[%s]}]}}`,
-					b.String())
+				fmt.Fprintf(w, matrixTmpl, b.String())
 			}))
 		}
 		up1 := mk(&m1Hits)
@@ -416,62 +311,18 @@ backends:
 		up2 := mk(&m2Hits)
 		t.Cleanup(up2.Close)
 
-		frontPort := 18920
-		metricsPort := 18921
-		mgmtPort := 18922
+		ports, release := portutil.Reserve(t, 3)
+		frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
 
-		yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-  mem2:
-    provider: memory
-backends:
-  prom-c1:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-c2:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem2
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-tsm-mixed-cache:
-    provider: alb
-    alb:
-      mechanism: tsm
-      output_format: prometheus
-      pool:
-        - prom-c1
-        - prom-c2
-`, frontPort, metricsPort, mgmtPort, up1.URL, up2.URL)
+		yaml := fmt.Sprintf(albTestdata(t, "alb_cache/v3.yaml.tmpl"),
+			frontPort, metricsPort, mgmtPort, up1.URL, up2.URL)
 
 		cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 		require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
 
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
+		release()
 		go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
 		waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
 
@@ -526,5 +377,224 @@ backends:
 		assert.Containsf(t, raw, "phit",
 			"mixed cache hit/miss across pool members did not surface phit in X-Trickster-Result=%q",
 			raw)
+	})
+
+	t.Run("V4 tsm merges proxy-only pool members", func(t *testing.T) {
+		var m1Hits, m2Hits atomic.Int64
+		mk := func(job string, hits *atomic.Int64) *httptest.Server {
+			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = r.ParseForm()
+				start, _ := parseInt(r.Form.Get("start"))
+				end, _ := parseInt(r.Form.Get("end"))
+				step, _ := parseInt(r.Form.Get("step"))
+				if step == 0 {
+					step = 15
+				}
+				hits.Add(1)
+				var b strings.Builder
+				first := true
+				for ts := start; ts <= end; ts += step {
+					if !first {
+						b.WriteString(",")
+					}
+					first = false
+					fmt.Fprintf(&b, `[%d,"1"]`, ts)
+				}
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintf(w, `{"status":"success","data":{"resultType":"matrix","result":[`+
+					`{"metric":{"__name__":"up","job":%q},"values":[%s]}]}}`, job, b.String())
+			}))
+		}
+		up1 := mk("proxy-only-a", &m1Hits)
+		t.Cleanup(up1.Close)
+		up2 := mk("proxy-only-b", &m2Hits)
+		t.Cleanup(up2.Close)
+
+		ports, release := portutil.Reserve(t, 3)
+		frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
+
+		yaml := fmt.Sprintf(albTestdata(t, "alb_cache/v4.yaml.tmpl"),
+			frontPort, metricsPort, mgmtPort, up1.URL, up2.URL)
+
+		cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
+		require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		release()
+		go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
+		waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
+
+		client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+		now := time.Now()
+		end := now.Truncate(15 * time.Second)
+		start := end.Add(-2 * time.Minute)
+		params := url.Values{
+			"query": {fmt.Sprintf("up + 0*%d", now.UnixNano())},
+			"start": {fmt.Sprintf("%d", start.Unix())},
+			"end":   {fmt.Sprintf("%d", end.Unix())},
+			"step":  {"15"},
+		}
+		u := fmt.Sprintf("http://127.0.0.1:%d/alb-tsm-proxy-only/api/v1/query_range?%s",
+			frontPort, params.Encode())
+
+		var resp *http.Response
+		var body []byte
+		require.EventuallyWithT(t, func(c *assert.CollectT) {
+			r, err := client.Get(u)
+			if !assert.NoError(c, err) {
+				return
+			}
+			b, _ := io.ReadAll(r.Body)
+			r.Body.Close()
+			resp, body = r, b
+			if !assert.Equal(c, http.StatusOK, r.StatusCode, "body=%s", string(b)) {
+				return
+			}
+			assert.GreaterOrEqual(c, m1Hits.Load(), int64(1),
+				"waiting for proxy-only member A to receive a request")
+			assert.GreaterOrEqual(c, m2Hits.Load(), int64(1),
+				"waiting for proxy-only member B to receive a request")
+		}, 10*time.Second, 250*time.Millisecond, "proxy-only TSM pool never merged both members")
+
+		t.Logf("status=%d X-Trickster-Result=%q m1Hits=%d m2Hits=%d body=%s",
+			resp.StatusCode, resp.Header.Get("X-Trickster-Result"), m1Hits.Load(), m2Hits.Load(), string(body))
+
+		var pr promResponse
+		require.NoError(t, json.Unmarshal(body, &pr),
+			"merged body must be valid prom JSON; status=%d body=%s", resp.StatusCode, string(body))
+		require.Equal(t, "success", pr.Status)
+		var qd promQueryData
+		require.NoError(t, json.Unmarshal(pr.Data, &qd))
+		var series []struct {
+			Metric map[string]string `json:"metric"`
+			Values [][]any           `json:"values"`
+		}
+		require.NoError(t, json.Unmarshal(qd.Result, &series))
+
+		jobs := map[string]bool{}
+		for _, s := range series {
+			jobs[s.Metric["job"]] = true
+			require.NotEmpty(t, s.Values, "series for job %q should include range points", s.Metric["job"])
+		}
+		require.True(t, jobs["proxy-only-a"], "merged body missing proxy-only member A: %s", string(body))
+		require.True(t, jobs["proxy-only-b"], "merged body missing proxy-only member B: %s", string(body))
+	})
+
+	t.Run("V5 tsm merges out-of-window proxy-only ranges without caching them", func(t *testing.T) {
+		var m1Hits, m2Hits atomic.Int64
+		mk := func(job string, hits *atomic.Int64) *httptest.Server {
+			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = r.ParseForm()
+				start, _ := parseInt(r.Form.Get("start"))
+				end, _ := parseInt(r.Form.Get("end"))
+				step, _ := parseInt(r.Form.Get("step"))
+				if step == 0 {
+					step = 15
+				}
+				hits.Add(1)
+				var b strings.Builder
+				first := true
+				for ts := start; ts <= end; ts += step {
+					if !first {
+						b.WriteString(",")
+					}
+					first = false
+					fmt.Fprintf(&b, `[%d,"1"]`, ts)
+				}
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintf(w, `{"status":"success","data":{"resultType":"matrix","result":[`+
+					`{"metric":{"__name__":"up","job":%q},"values":[%s]}]}}`, job, b.String())
+			}))
+		}
+		up1 := mk("old-range-a", &m1Hits)
+		t.Cleanup(up1.Close)
+		up2 := mk("old-range-b", &m2Hits)
+		t.Cleanup(up2.Close)
+
+		ports, release := portutil.Reserve(t, 3)
+		frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
+
+		yaml := fmt.Sprintf(albTestdata(t, "alb_cache/v5.yaml.tmpl"),
+			frontPort, metricsPort, mgmtPort, up1.URL, up2.URL)
+
+		cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
+		require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		release()
+		go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
+		waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
+
+		client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+		end := time.Now().Add(-10 * time.Minute).Truncate(15 * time.Second)
+		start := end.Add(-2 * time.Minute)
+		params := url.Values{
+			"query": {fmt.Sprintf("up + 0*%d", time.Now().UnixNano())},
+			"start": {fmt.Sprintf("%d", start.Unix())},
+			"end":   {fmt.Sprintf("%d", end.Unix())},
+			"step":  {"15"},
+		}
+		u := fmt.Sprintf("http://127.0.0.1:%d/alb-tsm-old-ranges/api/v1/query_range?%s",
+			frontPort, params.Encode())
+
+		var body []byte
+		require.EventuallyWithT(t, func(c *assert.CollectT) {
+			r, err := client.Get(u)
+			if !assert.NoError(c, err) {
+				return
+			}
+			b, _ := io.ReadAll(r.Body)
+			r.Body.Close()
+			body = b
+			if !assert.Equal(c, http.StatusOK, r.StatusCode, "body=%s", string(b)) {
+				return
+			}
+			assert.GreaterOrEqual(c, m1Hits.Load(), int64(1),
+				"waiting for old-range member A to receive a request")
+			assert.GreaterOrEqual(c, m2Hits.Load(), int64(1),
+				"waiting for old-range member B to receive a request")
+		}, 10*time.Second, 250*time.Millisecond, "out-of-window TSM query never merged both members")
+
+		var pr promResponse
+		require.NoError(t, json.Unmarshal(body, &pr),
+			"merged body must be valid prom JSON; body=%s", string(body))
+		require.Equal(t, "success", pr.Status)
+		var qd promQueryData
+		require.NoError(t, json.Unmarshal(pr.Data, &qd))
+		var series []struct {
+			Metric map[string]string `json:"metric"`
+			Values [][]any           `json:"values"`
+		}
+		require.NoError(t, json.Unmarshal(qd.Result, &series))
+		jobs := map[string]bool{}
+		for _, s := range series {
+			jobs[s.Metric["job"]] = true
+			require.NotEmpty(t, s.Values, "series for job %q should include range points", s.Metric["job"])
+		}
+		require.True(t, jobs["old-range-a"], "merged body missing old-range member A: %s", string(body))
+		require.True(t, jobs["old-range-b"], "merged body missing old-range member B: %s", string(body))
+
+		beforeA, beforeB := m1Hits.Load(), m2Hits.Load()
+		r, err := client.Get(u)
+		require.NoError(t, err)
+		_, _ = io.ReadAll(r.Body)
+		r.Body.Close()
+		require.Equal(t, http.StatusOK, r.StatusCode)
+		require.Greater(t, m1Hits.Load(), beforeA,
+			"out-of-window member A response should remain proxy-only, not cache hit")
+		require.Greater(t, m2Hits.Load(), beforeB,
+			"out-of-window member B response should remain proxy-only, not cache hit")
 	})
 }

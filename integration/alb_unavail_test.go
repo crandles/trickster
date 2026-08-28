@@ -29,7 +29,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/trickstercache/trickster/v2/integration/internal/portutil"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,8 +41,7 @@ import (
 // data path. After healthchecks mark it Failing, no further data requests
 // should reach it via the ALB.
 func TestALBUnavailableMemberNotQueried(t *testing.T) {
-	const healthyResp = `{"status":"success","data":{"resultType":"vector","result":[` +
-		`{"metric":{"__name__":"up","job":"healthy"},"value":[1700000000,"1"]}]}}`
+	healthyResp := albTestdata(t, "alb_unavail/healthy.json")
 
 	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -69,82 +69,29 @@ func TestALBUnavailableMemberNotQueried(t *testing.T) {
 	}))
 	t.Cleanup(broken.Close)
 
-	frontPort := 18650
-	metricsPort := 18651
-	mgmtPort := 18652
+	ports, release := portutil.Reserve(t, 3)
+	frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
 
-	yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-backends:
-  prom-healthy:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-broken:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-fr-test:
-    provider: alb
-    alb:
-      mechanism: fr
-      pool:
-        - prom-healthy
-        - prom-broken
-  alb-tsm-test:
-    provider: alb
-    alb:
-      mechanism: tsm
-      output_format: prometheus
-      pool:
-        - prom-healthy
-        - prom-broken
-`, frontPort, metricsPort, mgmtPort, healthy.URL, broken.URL)
+	yaml := fmt.Sprintf(albTestdata(t, "alb_unavail/unavail.yaml.tmpl"),
+		frontPort, metricsPort, mgmtPort, healthy.URL, broken.URL)
 
 	cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	release()
 	go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
 
 	metricsAddr := fmt.Sprintf("127.0.0.1:%d", metricsPort)
 	waitForTrickster(t, metricsAddr)
 
-	// Wait for the broken backend to record at least one healthcheck miss.
-	// failure_threshold: 1 + interval: 100ms means it should be marked
-	// unavailable within ~300ms.
-	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		assert.Greater(collect, brokenHCHits.Load(), int64(0),
-			"waiting for first healthcheck probe to broken backend")
-	}, 5*time.Second, 50*time.Millisecond)
-
-	// Give the pool a beat to refresh after the status flip.
-	time.Sleep(300 * time.Millisecond)
+	healthURL := "http://" + metricsAddr + "/trickster/health"
+	requireHealthState(t, healthURL, "prom-broken", "unavailable", 10*time.Second)
+	requireALBMemberState(t, healthURL, "alb-fr-test", "prom-broken", "unavailable", 10*time.Second)
+	requireALBMemberState(t, healthURL, "alb-tsm-test", "prom-broken", "unavailable", 10*time.Second)
+	require.Greater(t, brokenHCHits.Load(), int64(0),
+		"expected at least one healthcheck probe to the broken backend")
 
 	// Snapshot the counter just before issuing user traffic; subsequent growth
 	// is what we attribute to fanout from the ALB.

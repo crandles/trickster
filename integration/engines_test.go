@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -34,12 +33,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-)
-
-const (
-	engTricksterAddr = "127.0.0.1:8520"
-	engMetricsAddr   = "127.0.0.1:8521"
-	engOriginAddr    = "127.0.0.1:18520"
 )
 
 type engineFakeOrigin struct {
@@ -55,38 +48,44 @@ func (o *engineFakeOrigin) setHandler(h func(http.ResponseWriter, *http.Request)
 }
 
 var (
-	engSetupOnce sync.Once
-	engOrigin    *engineFakeOrigin
+	engSetupOnce     sync.Once
+	engOrigin        *engineFakeOrigin
+	engTricksterAddr string
+	engMetricsAddr   string
 )
 
 func engineSetup(t *testing.T) *engineFakeOrigin {
 	t.Helper()
 	engSetupOnce.Do(func() {
 		o := &engineFakeOrigin{}
-		ln, err := net.Listen("tcp", engOriginAddr)
-		if err != nil {
-			t.Fatalf("bind fake origin: %v", err)
-		}
-		srv := &httptest.Server{
-			Listener: ln,
-			Config: &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				o.mu.Lock()
-				h := o.handler
-				o.mu.Unlock()
-				if h == nil {
-					http.Error(w, "no handler", http.StatusServiceUnavailable)
-					return
-				}
-				h(w, r)
-			})},
-		}
-		srv.Start()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/v1/status/buildinfo" {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"status":"success","data":{"version":"test"}}`))
+				return
+			}
+			o.mu.Lock()
+			h := o.handler
+			o.mu.Unlock()
+			if h == nil {
+				http.Error(w, "no handler", http.StatusServiceUnavailable)
+				return
+			}
+			h(w, r)
+		}))
 		o.srv = srv
 		engOrigin = o
 
+		h := staticConfigHarness(t, "testdata/configs/engines.yaml")
+		rewriteGeneratedConfig(t, h.ConfigPath, "http://127.0.0.1:18520", srv.URL)
+		engTricksterAddr = h.BaseAddr
+		engMetricsAddr = h.MetricsAddr
+		if h.releasePorts != nil {
+			h.releasePorts()
+		}
 		ctx := context.Background()
 		go startTrickster(t, ctx, expectedStartError{},
-			"-config", "testdata/configs/engines.yaml")
+			"-config", h.ConfigPath)
 		waitForTrickster(t, engMetricsAddr)
 	})
 	return engOrigin
@@ -157,7 +156,7 @@ func TestEngines_PCF_Collapse(t *testing.T) {
 	results := make(chan result, n)
 	var wg sync.WaitGroup
 	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			defer wg.Done()
 			sc, b, _ := doEngineRange(t, params)
@@ -197,7 +196,7 @@ func TestEngines_Singleflight_ErrorPropagation(t *testing.T) {
 	results := make(chan result, n)
 	var wg sync.WaitGroup
 	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			defer wg.Done()
 			sc, b, _ := doEngineRange(t, params)
@@ -238,7 +237,7 @@ func TestEngines_Collapse_MetricsReport(t *testing.T) {
 	const n = 20
 	var wg sync.WaitGroup
 	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			defer wg.Done()
 			sc, _, _ := doEngineRange(t, params)
@@ -248,12 +247,15 @@ func TestEngines_Collapse_MetricsReport(t *testing.T) {
 	wg.Wait()
 	require.Equal(t, int32(1), counter.Load(), "collapse must hit origin exactly once")
 
-	// Metrics are incremented after the response is flushed.
+	// Metrics are incremented after the response is flushed. Window is
+	// generous because CI runners under -race + cgroup CPU limits routinely
+	// take an order of magnitude longer than local runs to flush 20 shared
+	// singleflight responses and scrape /metrics.
 	var after float64
 	require.Eventually(t, func() bool {
 		after = readProxyHitCount(t)
 		return after-before >= float64(n-1)
-	}, 3*time.Second, 50*time.Millisecond,
+	}, 15*time.Second, 25*time.Millisecond,
 		"proxy-hit metric did not reach expected delta (before=%v)", before)
 
 	require.InDelta(t, float64(n-1), after-before, 0.0001,
@@ -324,7 +326,7 @@ func readProxyHitCount(t *testing.T) float64 {
 	b, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	var total float64
-	for _, line := range strings.Split(string(b), "\n") {
+	for line := range strings.SplitSeq(string(b), "\n") {
 		if line == "" || line[0] == '#' {
 			continue
 		}

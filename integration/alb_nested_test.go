@@ -31,6 +31,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/trickstercache/trickster/v2/integration/internal/portutil"
+	"github.com/trickstercache/trickster/v2/integration/promstub"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -42,10 +45,7 @@ import (
 //   - alb-inner appears in alb-outer's availablePoolMembers (not unchecked)
 //   - traffic through alb-outer reaches alb-inner's leaf members
 func TestALBNestedPoolAvailable(t *testing.T) {
-	const promRange = `{"status":"success","data":{"resultType":"matrix","result":[` +
-		`{"metric":{"__name__":"up","job":"prometheus"},"values":[%s]}` +
-		`]}}`
-	const buildInfo = `{"status":"success","data":{"version":"2.0"}}`
+	promRange := albTestdata(t, "alb_nested/prom_range.json.tmpl")
 
 	mkRange := func(start, end, step int64) string {
 		var b strings.Builder
@@ -63,12 +63,11 @@ func TestALBNestedPoolAvailable(t *testing.T) {
 	var aHits, bHits atomic.Int64
 	mk := func(hits *atomic.Int64) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			if r.URL.Path == "/api/v1/status/buildinfo" {
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, buildInfo)
+			if r.URL.Path == promstub.BuildInfoPath {
+				promstub.WriteBuildInfo(w)
 				return
 			}
+			w.Header().Set("Content-Type", "application/json")
 			_ = r.ParseForm()
 			start, _ := parseInt(r.Form.Get("start"))
 			end, _ := parseInt(r.Form.Get("end"))
@@ -86,68 +85,18 @@ func TestALBNestedPoolAvailable(t *testing.T) {
 	leafB := mk(&bHits)
 	t.Cleanup(leafB.Close)
 
-	const (
-		frontPort   = 18960
-		metricsPort = 18961
-		mgmtPort    = 18962
-	)
+	ports, release := portutil.Reserve(t, 3)
+	frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
 
-	yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-backends:
-  prom-a:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-b:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-inner:
-    provider: alb
-    alb:
-      mechanism: rr
-      pool:
-        - prom-a
-        - prom-b
-  alb-outer:
-    provider: alb
-    alb:
-      mechanism: tsm
-      output_format: prometheus
-      pool:
-        - alb-inner
-`, frontPort, metricsPort, mgmtPort, leafA.URL, leafB.URL)
+	yaml := fmt.Sprintf(albTestdata(t, "alb_nested/nested.yaml.tmpl"),
+		frontPort, metricsPort, mgmtPort, leafA.URL, leafB.URL)
 
 	cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 	require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	release()
 	go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
 
 	metricsAddr := fmt.Sprintf("127.0.0.1:%d", metricsPort)
@@ -184,6 +133,118 @@ backends:
 			"waiting for nested alb to fan traffic to a leaf")
 	}, 10*time.Second, 200*time.Millisecond,
 		"alb-outer never routed traffic through alb-inner to leaf upstreams")
+}
+
+func TestALBNestedReplicaGroupsUseTerminalTSMPlanner(t *testing.T) {
+	leaf := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == promstub.BuildInfoPath {
+				promstub.WriteBuildInfo(w)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w,
+				`{"status":"success","data":{"resultType":"vector","result":[`+
+					`{"metric":{"job":"api"},"value":[100,"1"]}]}}`)
+		}))
+	}
+	leafA1 := leaf()
+	t.Cleanup(leafA1.Close)
+	leafA2 := leaf()
+	t.Cleanup(leafA2.Close)
+	leafB := leaf()
+	t.Cleanup(leafB.Close)
+
+	ports, release := portutil.Reserve(t, 3)
+	frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
+	yaml := fmt.Sprintf(`
+listeners:
+  default:
+    port: %d
+  metrics:
+    port: %d
+  mgmt:
+    port: %d
+backends:
+  prom-a1:
+    provider: prometheus
+    origin_url: %s
+    prometheus:
+      labels:
+        route: a1
+  prom-a2:
+    provider: prometheus
+    origin_url: %s
+    prometheus:
+      labels:
+        route: a2
+  prom-b:
+    provider: prometheus
+    origin_url: %s
+    prometheus:
+      labels:
+        route: b
+  rr-a1:
+    provider: alb
+    replica_group: shard-a
+    alb:
+      mechanism: round_robin
+      pool: [prom-a1]
+  rr-a2:
+    provider: alb
+    replica_group: shard-a
+    alb:
+      mechanism: round_robin
+      pool: [prom-a2]
+  rr-b:
+    provider: alb
+    replica_group: shard-b
+    alb:
+      mechanism: round_robin
+      pool: [prom-b]
+  alb-outer:
+    provider: alb
+    alb:
+      mechanism: tsm
+      pool: [rr-a1, rr-a2, rr-b]
+`, frontPort, metricsPort, mgmtPort, leafA1.URL, leafA2.URL, leafB.URL)
+	cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
+	require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0o644))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	release()
+	go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
+	waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
+
+	u := fmt.Sprintf("http://127.0.0.1:%d/alb-outer/api/v1/query?query=%s",
+		frontPort, url.QueryEscape("sum by (job) (requests)"))
+	resp, err := http.Get(u)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", body)
+
+	var result struct {
+		Status string `json:"status"`
+		Data   struct {
+			Result []struct {
+				Metric map[string]string `json:"metric"`
+				Value  []json.RawMessage `json:"value"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(body, &result))
+	require.Equal(t, "success", result.Status)
+	require.Len(t, result.Data.Result, 1, "body=%s", body)
+	require.Len(t, result.Data.Result[0].Value, 2, "body=%s", body)
+	require.Equal(t, map[string]string{"job": "api"}, result.Data.Result[0].Metric,
+		"terminal injected labels must be stripped before merging")
+	var value string
+	require.NoError(t, json.Unmarshal(result.Data.Result[0].Value[1], &value))
+	require.Equal(t, "2", value,
+		"nested planner must sum two logical shards while deduplicating shard-a replicas")
 }
 
 // requireALBMemberNotIn asserts the named member does not appear in the given

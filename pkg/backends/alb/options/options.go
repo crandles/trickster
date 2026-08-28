@@ -30,20 +30,29 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/config/types"
 	"github.com/trickstercache/trickster/v2/pkg/util/pointers"
 	"github.com/trickstercache/trickster/v2/pkg/util/sets"
+
+	"go.yaml.in/yaml/v3"
 )
 
 // Options defines options for ALBs
 type Options struct {
 	// MechanismName indicates the name of the load balancing mechanism
 	MechanismName string `yaml:"mechanism,omitempty"`
-	// Pool provides the list of backend names to be used by the load balancer
-	Pool []string `yaml:"pool,omitempty"`
-	// HealthyFloor is the minimum health check status value to be considered Available in the pool
-	// -1 : all pool members are Available regardless of health check status
-	//  0 (default) : pool members with status of unknown (0) or healthy (1) are Available
-	//  1 : only pool members with status of healthy (1) are Available
-	// unknown means the first hc hasn't returned yet,
-	// or (more likely) HealthCheck Interval on target backend is not set
+	// Pool provides the list of pool members (backend name + optional
+	// weight) to be used by the load balancer
+	Pool PoolMemberList `yaml:"pool,omitempty"`
+	// Discovery, when set, binds this ALB's pool to a named discoverer from
+	// the top-level 'discovery' config section; discovered members are
+	// additive to static Pool entries
+	Discovery *DiscoveryOptions `yaml:"discovery,omitempty"`
+	// HealthyFloor is the minimum health check status value admitted to the pool.
+	// Values below 0 admit members the probe has confirmed Failing; only set
+	// this below 0 if you intend to route to known-broken upstreams.
+	// -1 : all pool members admitted, including Failing
+	//  0 (default) : Unknown (0) and Healthy (1) admitted, Failing rejected
+	//  1 : only Healthy (1) admitted
+	// Unknown means the first health check hasn't returned yet, or the target
+	// backend has no health check interval configured.
 	HealthyFloor int `yaml:"healthy_floor,omitempty"`
 	// MaxCaptureBytes overrides the backend-level max_capture_bytes for this
 	// ALB's fanout members. Set this when the ALB's expected response shape
@@ -52,6 +61,11 @@ type Options struct {
 	// runaway upstreams faster). When 0, falls back to the parent Backend's
 	// max_capture_bytes, then to the package-level default (256 MiB).
 	MaxCaptureBytes int `yaml:"max_capture_bytes,omitempty"`
+	// MaxFanoutCaptureBytes, if > 0, caps the aggregate in-flight
+	// capture-buffer reservations across all slots in one ALB fanout call.
+	// When 0, falls back to the parent Backend's max_fanout_capture_bytes,
+	// which itself defaults to 0 (no aggregate cap).
+	MaxFanoutCaptureBytes int `yaml:"max_fanout_capture_bytes,omitempty"`
 	// OutputFormat accompanies the tsmerge Mechanism to indicate the provider output format
 	// options include any valid time seres backend like prometheus, influxdb or clickhouse
 	OutputFormat string `yaml:"output_format,omitempty"`
@@ -80,6 +94,13 @@ type FirstGoodResponseOptions struct {
 
 type TimeSeriesMergeOptions struct {
 	ConcurrencyOptions ConcurrencyOptions `yaml:",inline"`
+	// DedupToleranceMs is an opt-in tolerance window (milliseconds) for
+	// clustering near-duplicate samples produced by replicas in the same
+	// replica group. When two replicas sample the same metric at timestamps that
+	// differ by <= this many milliseconds, the cluster collapses to a single
+	// survivor (first-seen-after-sort wins). Nil or 0 preserves the legacy
+	// exact-epoch dedup behavior.
+	DedupToleranceMs *int `yaml:"dedup_tolerance_ms,omitempty"`
 }
 
 type NewestLastModifiedOptions struct {
@@ -158,6 +179,9 @@ func (o *Options) Clone() *Options {
 	if o.UserRouter != nil {
 		c.UserRouter = o.UserRouter.Clone()
 	}
+	if o.Discovery != nil {
+		c.Discovery = o.Discovery.Clone()
+	}
 	c.Pool = slices.Clone(o.Pool)
 	c.FGRStatusCodes = fsc
 	c.FgrCodesLookup = fscm
@@ -185,6 +209,12 @@ func (o *Options) Initialize(_ string) error {
 		}
 	}
 
+	if o.Discovery != nil {
+		if err := o.Discovery.Initialize(""); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -203,22 +233,107 @@ func (o *Options) Validate() (bool, error) {
 			return false, ErrOutputFormatOnlyForTSM
 		}
 	}
+	if o.Discovery != nil {
+		if _, err := o.Discovery.Validate(); err != nil {
+			return false, err
+		}
+	}
 	return true, nil
 }
 
 func (o *Options) ValidatePool(backendName string, allBackends sets.Set[string]) error {
-	for _, bn := range o.Pool {
-		if _, ok := allBackends[bn]; !ok {
-			return te.NewErrInvalidPoolMemberName(backendName, bn)
+	if err := o.Pool.Validate(backendName); err != nil {
+		return err
+	}
+	for _, m := range o.Pool {
+		if _, ok := allBackends[m.Name]; !ok {
+			return te.NewErrInvalidPoolMemberName(backendName, m.Name)
 		}
 	}
 	return nil
 }
 
-func (o *Options) UnmarshalYAML(unmarshal func(any) error) error {
+// ValidateNoCycles walks the ALB reference graph and returns an error if any
+// ALB transitively references itself. The input maps ALB-backend name to its
+// Options; non-ALB targets are leaves and ignored. A back edge to a node
+// currently on the DFS stack is reported as a cycle.
+//
+// Edges considered: (a) every entry of o.Pool, and (b) for ALBs configured
+// with the user_router mechanism, o.UserRouter.DefaultBackend plus every
+// o.UserRouter.Users[*].ToBackend. Without the user_router edges, a config
+// like alb1.mechanism=user_router with user_router.default_backend=alb1
+// passes validation and exhausts the goroutine stack on the first request.
+func ValidateNoCycles(albs map[string]*Options) error {
+	const (
+		unseen   = 0
+		visiting = 1
+		done     = 2
+	)
+	state := make(map[string]int, len(albs))
+	var visit func(name string, path []string) error
+	visit = func(name string, path []string) error {
+		switch state[name] {
+		case visiting:
+			// back edge: cycle detected; render the cycle for the operator.
+			// slices.Index can return -1 if state is corrupt; clamp to 0.
+			start := max(slices.Index(path, name), 0)
+			cyc := append(slices.Clone(path[start:]), name)
+			return fmt.Errorf("cycle detected in alb pool references: %s "+
+				"(previously caused stack overflow at request time; "+
+				"now rejected at startup)",
+				strings.Join(cyc, " -> "))
+		case done:
+			return nil
+		}
+		o, ok := albs[name]
+		if !ok {
+			// not an ALB; leaf for cycle purposes
+			return nil
+		}
+		state[name] = visiting
+		path = append(path, name)
+		for _, target := range albEdges(o) {
+			if _, isALB := albs[target]; !isALB {
+				continue
+			}
+			if err := visit(target, path); err != nil {
+				return err
+			}
+		}
+		state[name] = done
+		return nil
+	}
+	for name := range albs {
+		if err := visit(name, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// albEdges returns every backend name this ALB can dispatch to. For pool-
+// based mechanisms this is just o.Pool; for user_router-typed ALBs it also
+// includes UserRouter.DefaultBackend and every Users[*].ToBackend.
+func albEdges(o *Options) []string {
+	edges := make([]string, 0, len(o.Pool))
+	edges = append(edges, o.Pool.Names()...)
+	if o.UserRouter != nil {
+		if o.UserRouter.DefaultBackend != "" {
+			edges = append(edges, o.UserRouter.DefaultBackend)
+		}
+		for _, u := range o.UserRouter.Users {
+			if u != nil && u.ToBackend != "" {
+				edges = append(edges, u.ToBackend)
+			}
+		}
+	}
+	return edges
+}
+
+func (o *Options) UnmarshalYAML(value *yaml.Node) error {
 	type loadOptions Options
 	lo := loadOptions(*(New()))
-	if err := unmarshal(&lo); err != nil {
+	if err := value.Decode(&lo); err != nil {
 		return err
 	}
 	*o = Options(lo)

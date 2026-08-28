@@ -20,6 +20,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -27,46 +28,48 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/stretchr/testify/require"
+	"github.com/trickstercache/trickster/v2/integration/internal/portutil"
 	tkconfig "github.com/trickstercache/trickster/v2/pkg/config"
+	"github.com/trickstercache/trickster/v2/pkg/config/listener"
 	"github.com/trickstercache/trickster/v2/pkg/config/mgmt"
-	"gopkg.in/yaml.v2"
+
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v3"
 )
 
 type tricksterHarness struct {
-	ConfigPath  string // path to YAML config passed to the daemon
-	BaseAddr    string // host:port of the data listener (e.g. "127.0.0.1:8480")
-	MetricsAddr string // host:port of the metrics/health listener
+	ConfigPath                 string // path to YAML config passed to the daemon
+	BaseAddr                   string // host:port of the data listener (e.g. "127.0.0.1:8480")
+	MetricsAddr                string // host:port of the metrics/health listener
+	MgmtAddr                   string // host:port of the management listener
+	MySQLAddr                  string // host:port of the MySQL protocol listener, when configured
+	ClickHouseNativeAddr       string // native listener backed by ClickHouse HTTP
+	ClickHouseNativeOriginAddr string // native listener backed by ClickHouse native
+	releasePorts               func() // releases ports reserved while the config is prepared
 }
 
-func developerHarness() tricksterHarness {
-	return tricksterHarness{
-		ConfigPath:  "../docs/developer/environment/trickster-config/trickster.yaml",
-		BaseAddr:    "127.0.0.1:8480",
-		MetricsAddr: "127.0.0.1:8481",
-	}
+func developerHarness(t *testing.T) tricksterHarness {
+	t.Helper()
+	return configHarness(t)
 }
 
-func albHarness() tricksterHarness {
-	return tricksterHarness{
-		ConfigPath:  "testdata/alb.yaml",
-		BaseAddr:    "127.0.0.1:8490",
-		MetricsAddr: "127.0.0.1:8491",
-	}
+func albHarness(t *testing.T) tricksterHarness {
+	t.Helper()
+	return staticConfigHarness(t, "testdata/alb.yaml")
 }
 
-func rewriterHarness() tricksterHarness {
-	return tricksterHarness{
-		ConfigPath:  "testdata/rewriter.yaml",
-		BaseAddr:    "127.0.0.1:8493",
-		MetricsAddr: "127.0.0.1:8494",
-	}
+func rewriterHarness(t *testing.T) tricksterHarness {
+	t.Helper()
+	return staticConfigHarness(t, "testdata/rewriter.yaml")
 }
 
 func (h tricksterHarness) start(t *testing.T) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	if h.releasePorts != nil {
+		h.releasePorts()
+	}
 	go startTrickster(t, ctx, expectedStartError{}, "-config", h.ConfigPath)
 	waitForTrickster(t, h.MetricsAddr)
 }
@@ -164,18 +167,105 @@ type cacheProviderCase struct {
 	Backend string // backend id, e.g. "prom1"
 }
 
-func writeTestConfig(t *testing.T, frontPort, metricsPort, mgmtPort int) string {
+func configHarness(t *testing.T, mods ...func(*tkconfig.Config)) tricksterHarness {
 	t.Helper()
-	b, err := os.ReadFile("../docs/developer/environment/trickster-config/trickster.yaml")
+	ports, release := portutil.Reserve(t, 6)
+	frontPort, metricsPort, mgmtPort, mysqlPort := ports[0], ports[1], ports[2], ports[3]
+	clickHouseHTTPOriginPort, clickHouseNativeOriginPort := ports[4], ports[5]
+	return tricksterHarness{
+		ConfigPath: writeTestConfig(t,
+			"../docs/developer/environment/trickster-config/trickster.yaml",
+			frontPort, metricsPort, mgmtPort, mysqlPort, clickHouseHTTPOriginPort, clickHouseNativeOriginPort, mods...),
+		BaseAddr:                   fmt.Sprintf("127.0.0.1:%d", frontPort),
+		MetricsAddr:                fmt.Sprintf("127.0.0.1:%d", metricsPort),
+		MgmtAddr:                   fmt.Sprintf("127.0.0.1:%d", mgmtPort),
+		MySQLAddr:                  fmt.Sprintf("127.0.0.1:%d", mysqlPort),
+		ClickHouseNativeAddr:       fmt.Sprintf("127.0.0.1:%d", clickHouseHTTPOriginPort),
+		ClickHouseNativeOriginAddr: fmt.Sprintf("127.0.0.1:%d", clickHouseNativeOriginPort),
+		releasePorts:               release,
+	}
+}
+
+func staticConfigHarness(t *testing.T, configPath string) tricksterHarness {
+	t.Helper()
+	ports, release := portutil.Reserve(t, 3)
+	frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
+	return tricksterHarness{
+		ConfigPath:   writeTestConfig(t, configPath, frontPort, metricsPort, mgmtPort, 0, 0, 0),
+		BaseAddr:     fmt.Sprintf("127.0.0.1:%d", frontPort),
+		MetricsAddr:  fmt.Sprintf("127.0.0.1:%d", metricsPort),
+		MgmtAddr:     fmt.Sprintf("127.0.0.1:%d", mgmtPort),
+		releasePorts: release,
+	}
+}
+
+func writeTestConfig(t *testing.T, configPath string,
+	frontPort, metricsPort, mgmtPort, mysqlPort, clickHouseHTTPOriginPort, clickHouseNativeOriginPort int,
+	mods ...func(*tkconfig.Config),
+) string {
+	t.Helper()
+	b, err := os.ReadFile(configPath)
 	require.NoError(t, err)
 	var c tkconfig.Config
 	require.NoError(t, yaml.Unmarshal(b, &c))
-	c.Frontend.ListenPort = frontPort
-	c.Metrics.ListenPort = metricsPort
+	if c.Listeners == nil {
+		c.Listeners = make(listener.Lookup)
+	}
+	if _, ok := c.Listeners["default"]; !ok {
+		if c.Frontend != nil {
+			c.Listeners["default"] = listener.FromFrontend(c.Frontend)
+		} else {
+			c.Listeners["default"] = &listener.Options{ListenPort: 8480}
+		}
+	}
+	if _, ok := c.Listeners["metrics"]; !ok {
+		c.Listeners["metrics"] = &listener.Options{
+			ListenPort: 8481,
+		}
+	}
+	if _, ok := c.Listeners["mgmt"]; !ok {
+		c.Listeners["mgmt"] = &listener.Options{
+			ListenPort: 8484,
+		}
+	}
+	c.Listeners["default"].ListenPort = frontPort
+	c.Listeners["default"].ListenAddress = "127.0.0.1"
+	c.Listeners["metrics"].ListenPort = metricsPort
+	c.Listeners["metrics"].ListenAddress = "127.0.0.1"
+	c.Listeners["mgmt"].ListenPort = mgmtPort
+	c.Listeners["mgmt"].ListenAddress = "127.0.0.1"
+	if mysqlListener := c.Listeners["mysql1"]; mysqlListener != nil {
+		mysqlListener.ListenAddress = "0.0.0.0"
+		mysqlListener.ListenPort = mysqlPort
+	}
+	if clickHouseHTTPOriginPort > 0 && c.Backends["click1"] != nil {
+		c.Listeners["clickhouse-native"] = &listener.Options{
+			Protocol: listener.ProtocolClickHouse, ListenAddress: "127.0.0.1", ListenPort: clickHouseHTTPOriginPort,
+		}
+		c.Backends["click1"].ListenerNames = []string{listener.DefaultFrontendName, "clickhouse-native"}
+	}
+	if clickHouseNativeOriginPort > 0 && c.Backends["click1"] != nil {
+		c.Listeners["clickhouse-native-origin-native"] = &listener.Options{
+			Protocol: listener.ProtocolClickHouse, ListenAddress: "127.0.0.1", ListenPort: clickHouseNativeOriginPort,
+		}
+		nativeOrigin := c.Backends["click1"].Clone()
+		nativeOrigin.Name = "click-native"
+		nativeOrigin.OriginURL = "http://127.0.0.1:9000"
+		nativeOrigin.Protocol = "native"
+		nativeOrigin.CacheName = "mem2"
+		nativeOrigin.ListenerNames = []string{listener.DefaultFrontendName, "clickhouse-native-origin-native"}
+		c.Backends["click-native"] = nativeOrigin
+	}
 	if c.MgmtConfig == nil {
 		c.MgmtConfig = mgmt.New()
 	}
-	c.MgmtConfig.ListenPort = mgmtPort
+	c.Frontend = nil
+	c.Metrics = nil
+	c.MgmtConfig.ListenAddress = ""
+	c.MgmtConfig.ListenPort = 0
+	for _, mod := range mods {
+		mod(&c)
+	}
 	out, err := yaml.Marshal(&c)
 	require.NoError(t, err)
 	path := filepath.Join(t.TempDir(), "trickster.yaml")

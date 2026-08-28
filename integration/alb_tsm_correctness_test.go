@@ -31,74 +31,39 @@ import (
 	"testing"
 	"time"
 
+	"github.com/trickstercache/trickster/v2/integration/internal/portutil"
+	"github.com/trickstercache/trickster/v2/integration/promstub"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestALBTSMCorrectness(t *testing.T) {
 	t.Run("D1 single member skips label stripping", func(t *testing.T) {
-		const vectorBody = `{"status":"success","data":{"resultType":"vector","result":[` +
-			`{"metric":{"__name__":"up","job":"prometheus"},"value":[1700000000,"1"]},` +
-			`{"metric":{"__name__":"up","job":"node"},"value":[1700000000,"1"]}` +
-			`]}}`
+		vectorBody := albTestdata(t, "alb_tsm_correctness/d1_vector.json")
 		mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			switch r.URL.Path {
-			case "/api/v1/status/buildinfo":
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
-			default:
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, vectorBody)
+			if r.URL.Path == promstub.BuildInfoPath {
+				promstub.WriteBuildInfo(w)
+				return
 			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, vectorBody)
 		}))
 		t.Cleanup(mock.Close)
 
-		frontPort := 18800
-		metricsPort := 18801
-		mgmtPort := 18802
+		ports, release := portutil.Reserve(t, 3)
+		frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
 
-		yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-backends:
-  prom-labeled:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    prometheus:
-      labels:
-        region: us-east
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-tsm-single:
-    provider: alb
-    alb:
-      mechanism: tsm
-      output_format: prometheus
-      pool:
-        - prom-labeled
-`, frontPort, metricsPort, mgmtPort, mock.URL)
+		yaml := fmt.Sprintf(albTestdata(t, "alb_tsm_correctness/d1.yaml.tmpl"),
+			frontPort, metricsPort, mgmtPort, mock.URL)
 
 		cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 		require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
 
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
+		release()
 		go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
 		waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
 
@@ -141,9 +106,7 @@ backends:
 		// 500 on the count() rewrite. With FinalizeWeightedAvg gated on
 		// (sumTS != nil && countTS != nil), the response degrades to the
 		// raw sum without any warning.
-		const matrixBodyTmpl = `{"status":"success","data":{"resultType":"matrix","result":[` +
-			`{"metric":{"job":"prometheus"},"values":[%s]}` +
-			`]}}`
+		matrixBodyTmpl := albTestdata(t, "alb_tsm_correctness/d2_matrix.json.tmpl")
 
 		mkMatrix := func(start, end, step int64, val string) string {
 			var b strings.Builder
@@ -161,12 +124,11 @@ backends:
 		var sumHits, countHits, otherHits atomic.Int64
 		makeMock := func(sumVal string) *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				if r.URL.Path == "/api/v1/status/buildinfo" {
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
 					return
 				}
+				w.Header().Set("Content-Type", "application/json")
 				_ = r.ParseForm()
 				q := r.Form.Get("query")
 				switch {
@@ -198,60 +160,18 @@ backends:
 		m2 := makeMock("20")
 		t.Cleanup(m2.Close)
 
-		frontPort := 18810
-		metricsPort := 18811
-		mgmtPort := 18812
+		ports, release := portutil.Reserve(t, 3)
+		frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
 
-		yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-backends:
-  prom-a:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-b:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-tsm-avg:
-    provider: alb
-    alb:
-      mechanism: tsm
-      output_format: prometheus
-      pool:
-        - prom-a
-        - prom-b
-`, frontPort, metricsPort, mgmtPort, m1.URL, m2.URL)
+		yaml := fmt.Sprintf(albTestdata(t, "alb_tsm_correctness/d2.yaml.tmpl"),
+			frontPort, metricsPort, mgmtPort, m1.URL, m2.URL)
 
 		cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 		require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
 
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
+		release()
 		go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
 		waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
 
@@ -314,30 +234,169 @@ backends:
 			resp.StatusCode, resp.Header.Get("X-Trickster-Result"), string(body))
 	})
 
+	t.Run("R1 topk and bottomk trim globally across shards", func(t *testing.T) {
+		type vectorSeries struct {
+			Metric map[string]string `json:"metric"`
+			Value  []any             `json:"value"`
+		}
+		type vectorData struct {
+			ResultType string         `json:"resultType"`
+			Result     []vectorSeries `json:"result"`
+		}
+		type vectorResponse struct {
+			Status string     `json:"status"`
+			Data   vectorData `json:"data"`
+		}
+
+		writeVector := func(w http.ResponseWriter, series []vectorSeries) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(vectorResponse{
+				Status: "success",
+				Data: vectorData{
+					ResultType: "vector",
+					Result:     series,
+				},
+			})
+		}
+		mkSeries := func(job, value string) vectorSeries {
+			return vectorSeries{
+				Metric: map[string]string{"__name__": "up", "job": job},
+				Value:  []any{float64(1700000000), value},
+			}
+		}
+
+		var rankHits atomic.Int64
+		makeMock := func(hits *atomic.Int64, series []vectorSeries) *httptest.Server {
+			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
+					return
+				}
+				_ = r.ParseForm()
+				q := r.Form.Get("query")
+				if strings.Contains(q, "topk") || strings.Contains(q, "bottomk") {
+					rankHits.Add(1)
+					w.WriteHeader(http.StatusInternalServerError)
+					fmt.Fprintf(w, `{"status":"error","error":"rank wrapper was not unwrapped: %s"}`, q)
+					return
+				}
+				hits.Add(1)
+				writeVector(w, series)
+			}))
+		}
+
+		var m1Hits, m2Hits atomic.Int64
+		m1 := makeMock(&m1Hits, []vectorSeries{
+			mkSeries("east-low", "1"),
+			mkSeries("east-high", "9"),
+		})
+		t.Cleanup(m1.Close)
+		m2 := makeMock(&m2Hits, []vectorSeries{
+			mkSeries("west-low", "0.5"),
+			mkSeries("west-mid", "5"),
+		})
+		t.Cleanup(m2.Close)
+
+		ports, release := portutil.Reserve(t, 3)
+		frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
+
+		yaml := fmt.Sprintf(albTestdata(t, "alb_tsm_correctness/d2.yaml.tmpl"),
+			frontPort, metricsPort, mgmtPort, m1.URL, m2.URL)
+
+		cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
+		require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		release()
+		go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
+		waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
+
+		queryRank := func(operator string) []vectorSeries {
+			t.Helper()
+			var series []vectorSeries
+			require.EventuallyWithT(t, func(c *assert.CollectT) {
+				beforeM1 := m1Hits.Load()
+				beforeM2 := m2Hits.Load()
+				query := fmt.Sprintf("%s(1, up + 0*%d)", operator, time.Now().UnixNano())
+				u := fmt.Sprintf("http://127.0.0.1:%d/alb-tsm-avg/api/v1/query?query=%s",
+					frontPort, url.QueryEscape(query))
+				r, err := http.Get(u)
+				if !assert.NoError(c, err) {
+					return
+				}
+				b, _ := io.ReadAll(r.Body)
+				r.Body.Close()
+				if !assert.Greater(c, m1Hits.Load(), beforeM1, "query=%s body=%s", query, string(b)) {
+					return
+				}
+				if !assert.Greater(c, m2Hits.Load(), beforeM2, "query=%s body=%s", query, string(b)) {
+					return
+				}
+				if !assert.Equal(c, http.StatusOK, r.StatusCode, "body=%s", string(b)) {
+					return
+				}
+				var pr promResponse
+				if !assert.NoError(c, json.Unmarshal(b, &pr)) {
+					return
+				}
+				if !assert.Equal(c, "success", pr.Status, "body=%s", string(b)) {
+					return
+				}
+				var qd promQueryData
+				if !assert.NoError(c, json.Unmarshal(pr.Data, &qd)) {
+					return
+				}
+				if !assert.Equal(c, "vector", qd.ResultType, "body=%s", string(b)) {
+					return
+				}
+				var got []vectorSeries
+				if !assert.NoError(c, json.Unmarshal(qd.Result, &got)) {
+					return
+				}
+				if !assert.Len(c, got, 1, "body=%s", string(b)) {
+					return
+				}
+				series = got
+			}, 5*time.Second, 100*time.Millisecond, "rank query never returned one globally trimmed series")
+			return series
+		}
+
+		top := queryRank("topk")
+		require.Equal(t, "east-high", top[0].Metric["job"])
+		require.Equal(t, "9", top[0].Value[1])
+
+		bottom := queryRank("bottomk")
+		require.Equal(t, "west-low", bottom[0].Metric["job"])
+		require.Equal(t, "0.5", bottom[0].Value[1])
+
+		require.GreaterOrEqual(t, m1Hits.Load()+m2Hits.Load(), int64(4),
+			"expected both topk and bottomk queries to fan out their inner expressions to both shards")
+		require.Zero(t, rankHits.Load(), "rank wrapper should not be sent to upstream shards")
+	})
+
 	t.Run("V2 partial failure surfaces in X-Trickster-Result", func(t *testing.T) {
-		const okVector = `{"status":"success","data":{"resultType":"vector","result":[` +
-			`{"metric":{"__name__":"up","job":"prometheus"},"value":[1700000000,"1"]}]}}`
+		okVector := albTestdata(t, "alb_tsm_correctness/v2_vector.json")
 
 		makeOK := func() *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				if r.URL.Path == "/api/v1/status/buildinfo" {
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
 					return
 				}
+				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 				fmt.Fprint(w, okVector)
 			}))
 		}
 		makeBroken := func() *httptest.Server {
 			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				if r.URL.Path == "/api/v1/status/buildinfo" {
-					w.WriteHeader(http.StatusOK)
-					fmt.Fprint(w, `{"status":"success","data":{"version":"2.0"}}`)
+				if r.URL.Path == promstub.BuildInfoPath {
+					promstub.WriteBuildInfo(w)
 					return
 				}
+				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
 				fmt.Fprint(w, `{"status":"error","errorType":"internal","error":"upstream down"}`)
 			}))
@@ -352,84 +411,18 @@ backends:
 		b3 := makeBroken()
 		t.Cleanup(b3.Close)
 
-		frontPort := 18820
-		metricsPort := 18821
-		mgmtPort := 18822
+		ports, release := portutil.Reserve(t, 3)
+		frontPort, metricsPort, mgmtPort := ports[0], ports[1], ports[2]
 
-		yaml := fmt.Sprintf(`
-frontend:
-  listen_port: %d
-metrics:
-  listen_port: %d
-mgmt:
-  listen_port: %d
-logging:
-  log_level: error
-caches:
-  mem1:
-    provider: memory
-backends:
-  prom-ok:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-b1:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-b2:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  prom-b3:
-    provider: prometheus
-    origin_url: %s
-    cache_name: mem1
-    healthcheck:
-      path: /api/v1/status/buildinfo
-      query: ""
-      interval: 100ms
-      timeout: 500ms
-      failure_threshold: 1
-      recovery_threshold: 1
-  alb-tsm-partial:
-    provider: alb
-    alb:
-      mechanism: tsm
-      output_format: prometheus
-      pool:
-        - prom-ok
-        - prom-b1
-        - prom-b2
-        - prom-b3
-`, frontPort, metricsPort, mgmtPort, ok.URL, b1.URL, b2.URL, b3.URL)
+		yaml := fmt.Sprintf(albTestdata(t, "alb_tsm_correctness/v2.yaml.tmpl"),
+			frontPort, metricsPort, mgmtPort, ok.URL, b1.URL, b2.URL, b3.URL)
 
 		cfgPath := filepath.Join(t.TempDir(), "trickster.yaml")
 		require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0644))
 
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
+		release()
 		go startTrickster(t, ctx, expectedStartError{}, "-config", cfgPath)
 		waitForTrickster(t, fmt.Sprintf("127.0.0.1:%d", metricsPort))
 

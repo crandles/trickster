@@ -17,15 +17,19 @@
 package tsm
 
 import (
+	"context"
+	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/trickstercache/trickster/v2/pkg/backends"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/errors"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/mech"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/mech/fanout"
-	"github.com/trickstercache/trickster/v2/pkg/backends/alb/mech/rr"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/mech/types"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/names"
 	"github.com/trickstercache/trickster/v2/pkg/backends/alb/options"
@@ -41,35 +45,64 @@ import (
 	"github.com/trickstercache/trickster/v2/pkg/proxy/params"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/request"
 	"github.com/trickstercache/trickster/v2/pkg/proxy/response/merge"
+	"github.com/trickstercache/trickster/v2/pkg/timeseries"
 	"github.com/trickstercache/trickster/v2/pkg/timeseries/dataset"
-	"golang.org/x/sync/errgroup"
+	tsmerge "github.com/trickstercache/trickster/v2/pkg/timeseries/merge"
 )
 
 const (
-	ID        types.ID   = 4
 	ShortName            = names.MechanismTSM
 	Name      types.Name = "time_series_merge"
 )
 
 type handler struct {
 	mech.PoolHolder
-	mergePaths      []string        // paths handled by the alb client that are enabled for tsmerge
-	nonmergeHandler types.Mechanism // when methodology is tsmerge, this handler is for non-mergeable paths
-	outputFormat    string          // the provider output format (e.g., "prometheus")
-	tsmOptions      options.TimeSeriesMergeOptions
-	maxCaptureBytes int
+	mergePaths            []string // paths handled by the alb client that are enabled for tsmerge
+	outputFormat          string   // the provider output format (e.g., "prometheus")
+	tsmOptions            options.TimeSeriesMergeOptions
+	maxCaptureBytes       int
+	maxFanoutCaptureBytes int
+	queryParser           backends.TimeseriesBackend
+
+	// poolVersion increments on every SetPool so cached pool-derived data
+	// (stripKeys) can be invalidated without locking.
+	poolVersion atomic.Uint64
+	// degradeActive is true while a configured-multi-member pool is dispatching
+	// with only one live member. It throttles the operator WARN to once per
+	// healthy->degraded transition instead of once per request.
+	degradeActive atomic.Bool
+	// cachedStripKeys memoizes the stripKeys slice across requests as long
+	// as the pool hasn't been replaced. Hot path is a single atomic load
+	// plus a uint64 compare.
+	cachedStripKeys atomic.Pointer[stripKeysSnapshot]
+}
+
+type mergeFinalizer interface {
+	FinalizeTSMMerge(query string, ts timeseries.Timeseries)
+}
+
+// stripKeysSnapshot binds a computed stripKeys slice to the poolVersion it
+// was derived from. Readers compare version against the current poolVersion;
+// a mismatch triggers a rebuild. The seen set lets subsequent calls union new
+// label keys in as targets become healthy without bumping poolVersion (a
+// target unhealthy on the first compute would otherwise be permanently
+// excluded until SetPool fires; see computeStripKeys). Snapshots are
+// immutable once stored, so copy-on-write is required to grow them.
+type stripKeysSnapshot struct {
+	version uint64
+	keys    []string
+	seen    map[string]struct{}
 }
 
 func RegistryEntry() types.RegistryEntry {
-	return types.RegistryEntry{ID: ID, Name: Name, ShortName: ShortName, New: New}
+	return types.RegistryEntry{Name: Name, ShortName: ShortName, New: New}
 }
 
 func New(o *options.Options, factories rt.Lookup) (types.Mechanism, error) {
-	nmh, _ := rr.New(nil, nil)
 	out := &handler{
-		nonmergeHandler: nmh,
-		tsmOptions:      o.TSMOptions,
-		maxCaptureBytes: o.MaxCaptureBytes,
+		tsmOptions:            o.TSMOptions,
+		maxCaptureBytes:       o.MaxCaptureBytes,
+		maxFanoutCaptureBytes: o.MaxFanoutCaptureBytes,
 	}
 	// this validates the merge configuration for the ALB client as it sets it up
 	// First, verify the output format is a support merge provider
@@ -88,6 +121,12 @@ func New(o *options.Options, factories rt.Lookup) (types.Mechanism, error) {
 		return nil, err
 	}
 	// convert the new time series handler to a mergeable timeseries handler to get the merge paths
+	tsb, ok := mc1.(backends.TimeseriesBackend)
+	if !ok {
+		return nil, errors.ErrInvalidTimeSeriesMergeProvider
+	}
+	out.queryParser = tsb
+
 	mc2, ok := mc1.(backends.MergeableTimeseriesBackend)
 	if !ok {
 		return nil, errors.ErrInvalidTimeSeriesMergeProvider
@@ -98,21 +137,117 @@ func New(o *options.Options, factories rt.Lookup) (types.Mechanism, error) {
 	return out, nil
 }
 
-func (h *handler) ID() types.ID {
-	return ID
+// dedupToleranceNanos returns the configured per-shard dedup tolerance as
+// nanoseconds. Nil/zero means tolerance is disabled (legacy exact-epoch dedup).
+func (h *handler) dedupToleranceNanos() int64 {
+	if h.tsmOptions.DedupToleranceMs == nil || *h.tsmOptions.DedupToleranceMs <= 0 {
+		return 0
+	}
+	// Clamp at math.MaxInt64/1e6 to avoid int64 multiply overflow producing a negative window.
+	const maxMs = math.MaxInt64 / 1_000_000
+	ms := min(*h.tsmOptions.DedupToleranceMs, maxMs)
+	return int64(ms) * 1_000_000
 }
 
 func (h *handler) Name() types.Name {
 	return ShortName
 }
 
-// SetPool overrides PoolHolder.SetPool to also propagate the pool to the
-// non-merge handler used for paths that bypass the TSM merge path.
+// SetPool overrides PoolHolder.SetPool so pool-derived caches can be
+// invalidated when the pool is replaced.
 func (h *handler) SetPool(p pool.Pool) {
 	h.PoolHolder.SetPool(p)
-	if h.nonmergeHandler != nil {
-		h.nonmergeHandler.SetPool(p)
+	h.poolVersion.Add(1)
+}
+
+// computeStripKeys returns the union of Prometheus injected-label keys across
+// pool backends. The cache is keyed by poolVersion (bumped by SetPool); within
+// the same poolVersion the cached union grows as new healthy targets are
+// observed. This avoids a regression where a target unhealthy at first
+// compute, then healthy on a later request, would have its injected labels
+// permanently excluded from the cached set until SetPool fired -- causing its
+// series to ship with un-stripped backend labels and split during dedup.
+// hl is the live-target snapshot for the current request. The union-on-each-call
+// design keeps the cache eventually consistent with every target that has been
+// healthy at least once, which is sufficient because labels can only need
+// stripping for targets whose responses have reached the merge.
+//
+// Concurrent calls may build divergent snapshots; atomic.Pointer.Store is
+// last-writer-wins, but every snapshot is a superset of previously-observed
+// keys for the same version, so the missed writer's union is harmless --
+// future calls will re-add anything dropped.
+func (h *handler) computeStripKeys(hl pool.Targets) []string {
+	ver := h.poolVersion.Load()
+	snap := h.cachedStripKeys.Load()
+
+	var baseKeys []string
+	var baseSeen map[string]struct{}
+	if snap != nil && snap.version == ver {
+		baseKeys = snap.keys
+		baseSeen = snap.seen
 	}
+
+	keys, seen := baseKeys, baseSeen
+	var grew bool
+	for _, t := range hl {
+		if t == nil {
+			continue
+		}
+		b := t.Backend()
+		if b == nil {
+			continue
+		}
+		if provider, ok := b.(backends.TSMInjectedLabelProvider); ok {
+			for _, key := range provider.TSMInjectedLabelKeys() {
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				if !grew {
+					// Copy-on-write: existing snapshot may be observed by other
+					// goroutines, so we cannot mutate seen/keys in place.
+					seen = make(map[string]struct{}, len(baseSeen)+1)
+					for seenKey := range baseSeen {
+						seen[seenKey] = struct{}{}
+					}
+					keys = append([]string(nil), baseKeys...)
+					grew = true
+				}
+				seen[key] = struct{}{}
+				keys = append(keys, key)
+			}
+			continue
+		}
+		cfg := b.Configuration()
+		if cfg == nil || cfg.Prometheus == nil {
+			continue
+		}
+		for k := range cfg.Prometheus.Labels {
+			if _, ok := seen[k]; ok {
+				continue
+			}
+			if !grew {
+				// Copy-on-write: existing snapshot may be observed by other
+				// goroutines, so we cannot mutate seen/keys in place.
+				seen = make(map[string]struct{}, len(baseSeen)+1)
+				for sk := range baseSeen {
+					seen[sk] = struct{}{}
+				}
+				keys = append([]string(nil), baseKeys...)
+				grew = true
+			}
+			seen[k] = struct{}{}
+			keys = append(keys, k)
+		}
+	}
+
+	if grew || snap == nil || snap.version != ver {
+		h.cachedStripKeys.Store(&stripKeysSnapshot{
+			version: ver,
+			keys:    keys,
+			seen:    seen,
+		})
+	}
+	return keys
 }
 
 func (h *handler) StopPool() {
@@ -127,7 +262,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		failures.HandleBadGateway(w, r)
 		return
 	}
-	hl := p.LiveTargets() // should return a fanout list
+	hl := p.Targets() // should return a fanout list
 	l := len(hl)
 	if l == 0 {
 		failures.HandleBadGateway(w, r)
@@ -145,13 +280,50 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defaultHandler.ServeHTTP(w, r)
 		return
 	}
-	// just proxy 1:1 if there's no per-request resources object;
-	// the single-member shortcut is decided after stripKeys is computed
-	// so we don't bypass label-stripping for solo pools (D1).
+	// just proxy 1:1 if there's no per-request resources object.
 	rsc := request.GetResources(r)
 	if rsc == nil {
 		defaultHandler.ServeHTTP(w, r)
 		return
+	}
+
+	// limit query time range if configured on the ALB backend
+	if rsc.BackendOptions != nil && rsc.BackendOptions.MaxQueryRange > 0 {
+		var trq *timeseries.TimeRangeQuery
+		if rsc.TimeRangeQuery != nil {
+			trq = rsc.TimeRangeQuery
+		} else if h.queryParser != nil {
+			parsedTrq, _, _, err := h.queryParser.ParseTimeRangeQuery(r)
+			if err == nil && parsedTrq != nil {
+				trq = parsedTrq
+				rsc.TimeRangeQuery = parsedTrq
+			}
+		}
+
+		if trq != nil {
+			duration := trq.Extent.End.Sub(trq.Extent.Start)
+			limit := time.Duration(rsc.BackendOptions.MaxQueryRange)
+			if duration > limit {
+				metrics.ProxyQueryRangeRejections.WithLabelValues(rsc.BackendOptions.Name).Inc()
+				clientIP := r.Header.Get("X-Forwarded-For")
+				if clientIP == "" {
+					clientIP = r.RemoteAddr
+				}
+				logger.Warn("query rejected due to max_query_range limit",
+					logging.Pairs{
+						"backendName": rsc.BackendOptions.Name,
+						"clientIP":    clientIP,
+						"path":        r.URL.Path,
+						"statement":   trq.Statement,
+						"start":       trq.Extent.Start.String(),
+						"end":         trq.Extent.End.String(),
+						"duration":    duration.String(),
+						"limit":       limit.String(),
+					})
+				http.Error(w, "query time range exceeds the allowed limit of "+limit.String(), http.StatusBadRequest)
+				return
+			}
+		}
 	}
 
 	// Determine the correct merge strategy for this query. We ask the first
@@ -162,7 +334,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case rsc.TimeRangeQuery != nil:
 		query = rsc.TimeRangeQuery.Statement
-	case len(hl) > 0 && hl[0] != nil:
+	case hl[0] != nil:
 		if b := hl[0].Backend(); b != nil {
 			if tsb, ok := b.(backends.TimeseriesBackend); ok {
 				if trq, _, _, err := tsb.ParseTimeRangeQuery(r); err == nil && trq != nil {
@@ -175,7 +347,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// rejects requests without start/end/step, so classify directly off
 	// the `query` form parameter. Without this, the merge-strategy
 	// classifier sees an empty string on every instant query and always
-	// falls back to Dedup — which defeats the per-query strip-injected-
+	// falls back to Dedup, which defeats the per-query strip-injected-
 	// labels path for any PromQL aggregation issued as an instant query.
 	//
 	// Body safety for POST form requests: params.GetRequestValues reads
@@ -191,64 +363,94 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			query = qp.Get("query")
 		}
 	}
-	var mergeStrategy dataset.MergeStrategy
-	var needsDualQuery bool
-	var warnMsg string
-	var mp backends.TSMMergeProvider
-	if len(hl) > 0 && hl[0] != nil {
+	plan := defaultTSMMergePlan(r, query)
+	var finalizer mergeFinalizer
+	if hl[0] != nil {
 		if b := hl[0].Backend(); b != nil {
-			if p, ok := b.(backends.TSMMergeProvider); ok {
-				mp = p
-				strategyInt, dq, w := mp.ClassifyMerge(query)
-				mergeStrategy, needsDualQuery, warnMsg = dataset.MergeStrategy(strategyInt), dq, w
+			if planner, ok := b.(backends.TSMMergeProvider); ok {
+				var err error
+				plan, err = planner.PlanTSMMerge(r, query)
+				if err != nil {
+					logger.Warn("tsm merge plan construction failure", logging.Pairs{"error": err})
+					failures.HandleBadGateway(w, r)
+					return
+				}
 			}
-			// backends that don't implement TSMMergeProvider default to dedup.
+			if f, ok := b.(mergeFinalizer); ok {
+				finalizer = f
+			}
 		}
 	}
+	if err := plan.Validate(); err != nil {
+		logger.Warn("invalid tsm merge plan", logging.Pairs{"error": err})
+		failures.HandleBadGateway(w, r)
+		return
+	}
+	if plan.Finalizer.Enabled && finalizer == nil {
+		logger.Warn("tsm merge plan requires an unavailable finalizer", nil)
+		failures.HandleBadGateway(w, r)
+		return
+	}
+	warnMsg := plan.UnsupportedWarning
 
 	// Collect injected label keys from pool backends so they can be stripped
 	// before merging. This ensures series from different backends hash
 	// identically despite having different injected labels (e.g., region tags).
-	// Stripping is only needed when a non-dedup strategy is in play.
+	// Stripping is needed for non-dedup strategies and plans that explicitly
+	// require routing labels to be removed before logical selection. The set is
+	// cached and reused across requests until the pool is replaced.
 	var stripKeys []string
-	if mergeStrategy != dataset.MergeStrategyDedup || needsDualQuery {
-		seen := make(map[string]struct{})
-		for _, t := range hl {
-			if t == nil {
-				continue
-			}
-			b := t.Backend()
-			if b == nil {
-				continue
-			}
-			cfg := b.Configuration()
-			if cfg != nil && cfg.Prometheus != nil {
-				for k := range cfg.Prometheus.Labels {
-					if _, ok := seen[k]; !ok {
-						seen[k] = struct{}{}
-						stripKeys = append(stripKeys, k)
-					}
-				}
-			}
-		}
+	if planNeedsLabelStripping(plan) {
+		stripKeys = h.computeStripKeys(hl)
 	}
 
-	// Single-member fast path: only safe when there's nothing to strip and
-	// the strategy is plain dedup. Otherwise the merge path is still needed
-	// to apply StripTags or the dual-query rewrite to the lone backend's
-	// response (D1).
-	if l == 1 && len(stripKeys) == 0 && mergeStrategy == dataset.MergeStrategyDedup && !needsDualQuery {
+	// A pool with fewer live replica groups than configured logical shards is
+	// degraded. Warn once per healthy->degraded transition (not per request)
+	// and route through the merge path so the warning reaches the response
+	// `warnings` field.
+	configuredTargets := p.ConfiguredTargets()
+	topology := replicaTopology(hl, configuredTargets)
+	var liveGroups int
+	for _, group := range topology {
+		if len(group.live) > 0 {
+			liveGroups++
+		}
+	}
+	configuredGroups := len(topology)
+	degraded := liveGroups < configuredGroups
+	if degraded {
+		if h.degradeActive.CompareAndSwap(false, true) {
+			bn := ""
+			if rsc.BackendOptions != nil {
+				bn = rsc.BackendOptions.Name
+			}
+			logger.Warn("alb tsm pool has unavailable replica groups",
+				logging.Pairs{
+					"backend_name":      bn,
+					"configured_groups": configuredGroups,
+					"live_groups":       liveGroups,
+				})
+		}
+		dw := fmt.Sprintf("trickster: served from %d of %d replica groups; results may be incomplete",
+			liveGroups, configuredGroups)
+		if warnMsg == "" {
+			warnMsg = dw
+		} else {
+			warnMsg += "; " + dw
+		}
+	} else {
+		h.degradeActive.Store(false)
+	}
+
+	// A plan may explicitly allow direct proxying when no planned rewrite,
+	// reduction, finalization, warning, or injected-label cleanup is needed.
+	if l == 1 && len(stripKeys) == 0 && plan.AllowSingleMemberBypass && !degraded {
 		defaultHandler.ServeHTTP(w, r)
 		return
 	}
 
-	if needsDualQuery {
-		h.serveWeightedAvg(w, r, hl, rsc, mp, query, stripKeys)
-		return
-	}
-
-	// Standard scatter/gather for all non-avg strategies.
-	h.serveStandard(w, r, hl, rsc, mergeStrategy, stripKeys, warnMsg)
+	h.servePlan(w, r, hl, rsc, plan, stripKeys, finalizer, warnMsg,
+		configuredTargets)
 }
 
 // gatherResult captures the per-member fanout outcome used to assemble the
@@ -261,7 +463,15 @@ type gatherResult struct {
 	statusCode int
 	header     http.Header
 	mergeFunc  merge.RespondFunc
+	contrib    *gatherContribution
 	failed     bool
+}
+
+type gatherContribution struct {
+	data           any
+	mergeFunc      merge.MergeFunc
+	batchMergeFunc merge.BatchMergeFunc
+	member         int
 }
 
 // pickWinner chooses which member's RespondFunc and headers feed the outbound
@@ -287,6 +497,18 @@ func pickWinner(results []gatherResult) (merge.RespondFunc, http.Header) {
 // outbound code is the lowest 2xx seen (so 200 wins over 206); otherwise the
 // highest non-2xx wins so the more severe failure propagates instead of being
 // masked by an incidentally-lower error code.
+func allFanoutFailed(results []fanout.Result) bool {
+	if len(results) == 0 {
+		return false
+	}
+	for _, r := range results {
+		if !r.Failed {
+			return false
+		}
+	}
+	return true
+}
+
 func aggregateStatus(results []gatherResult) (status int, statusHeader string, has2xx, hasNon2xx bool) {
 	var min2xx, maxErr int
 	for _, res := range results {
@@ -317,15 +539,146 @@ func aggregateStatus(results []gatherResult) (status int, statusHeader string, h
 	return
 }
 
+func prepareGatherContribution(ctx context.Context, rsc *request.Resources, body []byte, member int,
+	stripKeys []string,
+) *gatherContribution {
+	if ctx.Err() != nil || rsc == nil || rsc.MergeFunc == nil {
+		return nil
+	}
+	ts := rsc.TS
+	if ts == nil && len(body) > 0 && rsc.TSUnmarshaler != nil && rsc.TimeRangeQuery != nil {
+		var err error
+		ts, err = rsc.TSUnmarshaler(body, rsc.TimeRangeQuery)
+		if err != nil {
+			logger.Warn("tsm gather timeseries decode failure", logging.Pairs{
+				"member": member, "error": err,
+			})
+			return nil
+		}
+		rsc.TS = ts
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+	if len(stripKeys) > 0 && ts != nil {
+		if ds, ok := ts.(*dataset.DataSet); ok {
+			ds.StripTags(stripKeys)
+		}
+	}
+	var data any
+	if ts != nil {
+		data = ts
+	} else if len(body) > 0 {
+		data = body
+	} else {
+		return nil
+	}
+	return &gatherContribution{
+		data:           data,
+		mergeFunc:      rsc.MergeFunc,
+		batchMergeFunc: rsc.BatchMergeFunc,
+		member:         member,
+	}
+}
+
+// mergeGatherContributions preserves slot order and lets the backend-provided
+// batch function handle compatible inputs. Otherwise each contribution is
+// folded through its original MergeFunc.
+func mergeGatherContributions(ctx context.Context, accumulator *merge.Accumulator,
+	contributions []*gatherContribution,
+) []int {
+	items := make([]merge.BatchItem, 0, len(contributions))
+	batchCompatible := true
+	var batchMergeFunc merge.BatchMergeFunc
+	for _, contribution := range contributions {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if contribution == nil {
+			continue
+		}
+		items = append(items, merge.BatchItem{
+			Data:   contribution.data,
+			Member: contribution.member,
+		})
+		if contribution.batchMergeFunc == nil {
+			batchCompatible = false
+		} else if batchMergeFunc == nil {
+			batchMergeFunc = contribution.batchMergeFunc
+		}
+	}
+	if batchCompatible && batchMergeFunc != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		handled, err := mergeContributionBatch(accumulator, batchMergeFunc, items)
+		if err != nil {
+			logger.Warn("tsm gather batch merge failure", logging.Pairs{
+				"members": len(items), "error": err,
+			})
+			failed := make([]int, len(items))
+			for i, item := range items {
+				failed[i] = item.Member
+			}
+			return failed
+		}
+		if handled {
+			return nil
+		}
+	}
+
+	failed := make([]int, 0)
+	for _, contribution := range contributions {
+		if ctx.Err() != nil {
+			return failed
+		}
+		if contribution == nil {
+			continue
+		}
+		if err := mergeContribution(accumulator, contribution); err != nil {
+			logger.Warn("tsm gather merge failure", logging.Pairs{
+				"member": contribution.member, "error": err,
+			})
+			failed = append(failed, contribution.member)
+		}
+	}
+	return failed
+}
+
+func mergeContributionBatch(accumulator *merge.Accumulator,
+	batchMergeFunc merge.BatchMergeFunc, items []merge.BatchItem,
+) (handled bool, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("panic while batch merging contributions: %v", recovered)
+		}
+	}()
+	return batchMergeFunc(accumulator, items)
+}
+
+func mergeContribution(accumulator *merge.Accumulator,
+	contribution *gatherContribution,
+) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("panic while merging member %d: %v", contribution.member, recovered)
+		}
+	}()
+	return contribution.mergeFunc(accumulator, contribution.data, contribution.member)
+}
+
 // serveStandard handles the common scatter/gather path: each shard gets one
 // request, results are merged with mergeStrategy, and an optional warning is
 // appended to the accumulated dataset before writing the response.
 func (h *handler) serveStandard(
 	w http.ResponseWriter, r *http.Request,
 	hl pool.Targets, rsc *request.Resources,
-	mergeStrategy dataset.MergeStrategy,
+	mergeStrategy tsmerge.Strategy,
 	stripKeys []string,
+	query string,
+	finalizer mergeFinalizer,
 	warnMsg string,
+	configured ...pool.Targets,
 ) {
 	l := len(hl)
 
@@ -337,19 +690,27 @@ func (h *handler) serveStandard(
 		failures.HandleBadGateway(w, r)
 		return
 	}
+	parentCtx := r.Context()
 
-	fanoutResults, _ := fanout.All(r.Context(), r, hl, fanout.Config{
-		Mechanism:        "tsm",
-		ConcurrencyLimit: h.tsmOptions.ConcurrencyOptions.GetQueryConcurrencyLimit(),
-		MaxCaptureBytes:  h.maxCaptureBytes,
+	dedupToleranceNanos := h.dedupToleranceNanos()
+	fanoutResults, _ := fanout.All(parentCtx, r, hl, fanout.Config{
+		Mechanism:             names.MechanismTSM,
+		ConcurrencyLimit:      h.tsmOptions.ConcurrencyOptions.GetQueryConcurrencyLimit(),
+		MaxCaptureBytes:       h.maxCaptureBytes,
+		MaxFanoutCaptureBytes: h.maxFanoutCaptureBytes,
 		Resources: func(int) *request.Resources {
 			return &request.Resources{
-				IsMergeMember:   true,
-				TSReqestOptions: rsc.TSReqestOptions,
-				TSMergeStrategy: int(mergeStrategy),
+				IsMergeMember:         true,
+				TSReqestOptions:       rsc.TSReqestOptions,
+				TSMergeStrategy:       int(mergeStrategy),
+				TSDedupToleranceNanos: dedupToleranceNanos,
 			}
 		},
 		OnResult: func(i int, fr *fanout.Result) {
+			if parentCtx.Err() != nil {
+				results[i].failed = true
+				return
+			}
 			if fr.Failed || fr.Request == nil || fr.Capture == nil {
 				results[i].failed = true
 				return
@@ -362,16 +723,10 @@ func (h *handler) serveStandard(
 			if rsc2.MergeFunc == nil || rsc2.MergeRespondFunc == nil {
 				logger.Warn("tsm gather failed due to nil func", nil)
 			}
-			if len(stripKeys) > 0 && rsc2.TS != nil {
-				if ds, ok := rsc2.TS.(*dataset.DataSet); ok {
-					ds.StripTags(stripKeys)
-				}
-			}
-			var contributed bool
+			var contribution *gatherContribution
 			if rsc2.MergeFunc != nil {
 				if rsc2.TS != nil {
-					rsc2.MergeFunc(accumulator, rsc2.TS, i)
-					contributed = true
+					contribution = prepareGatherContribution(parentCtx, rsc2, nil, i, stripKeys)
 				} else {
 					body, derr := encoding.DecompressResponseBody(
 						fr.Capture.Header().Get(headers.NameContentEncoding),
@@ -385,8 +740,7 @@ func (h *handler) serveStandard(
 						return
 					}
 					if len(body) > 0 {
-						rsc2.MergeFunc(accumulator, body, i)
-						contributed = true
+						contribution = prepareGatherContribution(parentCtx, rsc2, body, i, stripKeys)
 					}
 				}
 			}
@@ -398,34 +752,55 @@ func (h *handler) serveStandard(
 				statusCode: sc,
 				header:     fr.Capture.Header(),
 				mergeFunc:  rsc2.MergeRespondFunc,
-				failed:     !contributed,
+				contrib:    contribution,
+				failed: contribution == nil || (sc != 0 &&
+					(sc < http.StatusOK || sc >= http.StatusMultipleChoices)),
 			}
 		},
 	})
+	if parentCtx.Err() != nil {
+		return
+	}
 
 	for i, fr := range fanoutResults {
 		if fr.Failed && !results[i].failed {
 			results[i].failed = true
 		}
 	}
+	contributions := usableGatherContributions(results)
+	var configuredTargets pool.Targets
+	if len(configured) > 0 {
+		configuredTargets = configured[0]
+	}
+	logical := contributions
+	var groupWarnings []string
+	var groupFailure bool
+	if mergeStrategy != tsmerge.StrategyScalar {
+		logical, groupWarnings, groupFailure = coalesceReplicaContributions(
+			parentCtx, hl, configuredTargets, contributions, "", dedupToleranceNanos)
+	}
+	for _, member := range mergeGatherContributions(parentCtx, accumulator, logical) {
+		if member >= 0 && member < len(results) {
+			results[member].failed = true
+		}
+	}
+	if parentCtx.Err() != nil {
+		return
+	}
 
 	// Surface goroutine-level failures (e.g. unsupported Content-Encoding,
 	// parse error) where a member produced no contribution but no HTTP
 	// status reached this layer. Without this, the merged response would
 	// silently look identical to a fully-successful fanout.
-	var hasGatherFailure bool
-	for i, res := range results {
+	logicalResults := coalesceReplicaResults(hl, configuredTargets, results)
+	hasGatherFailure := groupFailure
+	for _, res := range logicalResults {
 		if res.failed {
 			hasGatherFailure = true
-			metrics.ALBFanoutFailures.WithLabelValues("tsm", "", "no_contribution").Inc()
-			if ts := accumulator.GetTSData(); ts != nil {
-				if ds, ok := ts.(*dataset.DataSet); ok {
-					ds.Warnings = append(ds.Warnings,
-						"trickster: tsm partial failure: pool member "+strconv.Itoa(i)+" returned no usable response")
-				}
-			}
+			metrics.ALBFanoutFailures.WithLabelValues(names.MechanismTSM, "", "no_contribution").Inc()
 		}
 	}
+	appendPlanWarnings(accumulator, groupWarnings)
 
 	// For non-supportable aggregators, inject a warning into the Prometheus
 	// response so clients know the merged results may be inaccurate.
@@ -437,13 +812,31 @@ func (h *handler) serveStandard(
 		}
 	}
 
+	if parentCtx.Err() != nil {
+		return
+	}
+	if finalizer != nil {
+		finalizer.FinalizeTSMMerge(query, accumulator.GetTSData())
+	}
+	if parentCtx.Err() != nil {
+		return
+	}
+
+	// If every fanout slot failed at the dispatch level (panics, transport
+	// errors, all-clone-errors), surface 502 rather than the empty-200
+	// branch below.
+	if allFanoutFailed(fanoutResults) {
+		failures.HandleBadGateway(w, r)
+		return
+	}
+
 	// winnerHeaders carries custom response headers (e.g. those set by a
 	// pool member's path override via response_headers:) from the same
 	// member whose mergeFunc will write the final response. Without this,
 	// TSM fanout would strip any backend-set headers that FGR would
 	// happily propagate. See #970.
-	mrf, winnerHeaders := pickWinner(results)
-	statusCode, statusHeader, has2xx, hasNon2xx := aggregateStatus(results)
+	mrf, winnerHeaders := pickWinner(logicalResults)
+	statusCode, statusHeader, has2xx, hasNon2xx := aggregateStatus(logicalResults)
 	// Mixed 2xx + non-2xx fanout: surface a partial-hit marker so clients
 	// can detect that some members failed even when each member's own
 	// Trickster status string happens to agree (V2). hasGatherFailure
@@ -455,7 +848,7 @@ func (h *handler) serveStandard(
 	}
 
 	// preserve Set-Cookie from all members; headers.Merge below would otherwise collapse to winner only
-	mergeMultiValuedHeaders(w.Header(), results, winnerHeaders)
+	mergeMultiValuedHeaders(w.Header(), logicalResults, winnerHeaders)
 
 	// Carry the winner's custom headers onto the outbound response BEFORE
 	// setting the aggregated X-Trickster-Result. headers.Merge makes the
@@ -464,6 +857,10 @@ func (h *handler) serveStandard(
 	// member advertised for that key. Structural headers (Content-Type,
 	// Content-Length, Date, Last-Modified, Transfer-Encoding) were already
 	// removed by StripMergeHeaders.
+	if mrf == nil {
+		failures.HandleBadGateway(w, r)
+		return
+	}
 	if winnerHeaders != nil {
 		headers.Merge(w.Header(), winnerHeaders)
 	}
@@ -477,214 +874,104 @@ func (h *handler) serveStandard(
 	if statusCode == 0 {
 		statusCode = http.StatusOK
 	}
-	if mrf != nil {
-		mrf(w, r, accumulator, statusCode)
-	}
+	mrf(w, r, accumulator, statusCode)
 }
 
-// mergeMultiValuedHeaders appends every member's Set-Cookie values onto dst
+// usableGatherContributions excludes error envelopes when at least one member
+// produced usable 2xx data. If every member returned an error, retain their
+// parseable contributions so the backend responder can marshal an error body
+// instead of turning an empty accumulator into a 200 response.
+func usableGatherContributions(results []gatherResult) []*gatherContribution {
+	hasSuccess := false
+	for _, result := range results {
+		if !result.failed && result.contrib != nil &&
+			result.statusCode >= http.StatusOK &&
+			result.statusCode < http.StatusMultipleChoices {
+			hasSuccess = true
+			break
+		}
+	}
+	contributions := make([]*gatherContribution, len(results))
+	for i, result := range results {
+		if result.contrib != nil && (!result.failed || !hasSuccess) {
+			contributions[i] = result.contrib
+		}
+	}
+	return contributions
+}
+
+// mergeMultiValuedHeaders forwards Set-Cookie from the winning shard only
 // and clears Set-Cookie on winnerHeaders so the subsequent headers.Merge
-// (which uses Set semantics) doesn't collapse them. RFC 6265 allows multiple
-// Set-Cookie response headers; Warning (RFC 7234) is similar but no current
-// backend sets it.
-func mergeMultiValuedHeaders(dst http.Header, results []gatherResult, winnerHeaders http.Header) {
-	for _, res := range results {
-		if res.header == nil {
+// (which uses Set semantics) doesn't collapse multi-valued cookies. RFC 6265
+// allows multiple Set-Cookie response headers per response.
+//
+// Set-Cookie is winner-only (not aggregated across shards) so a TSM ALB
+// placed in front of tenant-scoped upstreams doesn't mix session cookies
+// between tenants. The results slice is retained in the signature for
+// future multi-valued headers that genuinely should aggregate.
+func mergeMultiValuedHeaders(dst http.Header, _ []gatherResult, winnerHeaders http.Header) {
+	if winnerHeaders == nil {
+		return
+	}
+	for _, v := range winnerHeaders.Values(headers.NameSetCookie) {
+		dst.Add(headers.NameSetCookie, v)
+	}
+	winnerHeaders.Del(headers.NameSetCookie)
+}
+
+// pruneUnpairedWeightedAvgSeries drops series from sumDS that have no
+// matching series in countDS under the same (statementID, pairing hash).
+// FinalizeWeightedAvg silently leaves unmatched series unfinalized (the
+// raw summed value is returned as if it were an average), so series with
+// no countDS counterpart must be removed before finalize. A single
+// warning naming the dropped series is appended to sumDS.Warnings so the
+// client can see which results were affected. pairingQueryStatement is
+// the same statement passed to FinalizeWeightedAvg.
+func pruneUnpairedWeightedAvgSeries(sumDS, countDS *dataset.DataSet, pairingQueryStatement string) {
+	if sumDS == nil || countDS == nil {
+		return
+	}
+	pairingHash := func(sh *dataset.SeriesHeader) dataset.Hash {
+		return sumDS.PairingHash(sh, pairingQueryStatement)
+	}
+	countSeries := make(map[int]map[dataset.Hash]struct{}, len(countDS.Results))
+	for _, r := range countDS.Results {
+		if r == nil {
 			continue
 		}
-		for _, v := range res.header.Values(headers.NameSetCookie) {
-			dst.Add(headers.NameSetCookie, v)
-		}
-	}
-	if winnerHeaders != nil {
-		winnerHeaders.Del(headers.NameSetCookie)
-	}
-}
-
-// serveWeightedAvg implements the dual-query scatter/gather for outer avg
-// aggregators. For each shard it fires two concurrent requests:
-//   - a "sum" variant (avg → sum) to accumulate the total sum per series
-//   - a "count" variant (avg → count) to accumulate the total count per series
-//
-// After all shards respond, FinalizeWeightedAvg divides sum by count to
-// produce a true weighted arithmetic mean, avoiding the skew that
-// avg-of-averages produces when shards have different cardinalities.
-// The original query string is passed for pairing so sum/count rewrites
-// align with the same logical statement (see dataset.FinalizeWeightedAvg).
-func (h *handler) serveWeightedAvg(
-	w http.ResponseWriter, r *http.Request,
-	hl pool.Targets, rsc *request.Resources,
-	mp backends.TSMMergeProvider, query string, stripKeys []string,
-) {
-	l := len(hl)
-
-	// Rewrite the request once; the provider encapsulates both the query
-	// expression substitution and the wire-protocol injection (URL param,
-	// POST body, etc.).
-	sumBase, countBase := mp.RewriteForWeightedAvg(r, query)
-
-	sumBase, err := fanout.PrimeBody(sumBase)
-	if err != nil {
-		failures.HandleBadGateway(w, r)
-		return
-	}
-	countBase, err = fanout.PrimeBody(countBase)
-	if err != nil {
-		failures.HandleBadGateway(w, r)
-		return
-	}
-
-	sumAccum := merge.NewAccumulator()
-	countAccum := merge.NewAccumulator()
-
-	limit := h.tsmOptions.ConcurrencyOptions.GetQueryConcurrencyLimit()
-
-	// results captures sum-query outcomes only -- the response envelope
-	// (status, headers, RespondFunc) comes from the sum side; count results
-	// affect the arithmetic, not the envelope.
-	results := make([]gatherResult, l)
-
-	resourcesFn := func(int) *request.Resources {
-		return &request.Resources{
-			IsMergeMember:   true,
-			TSReqestOptions: rsc.TSReqestOptions,
-			TSMergeStrategy: int(dataset.MergeStrategySum),
-		}
-	}
-
-	parentCtx := r.Context()
-	var eg errgroup.Group
-	eg.Go(func() error {
-		_, err := fanout.All(parentCtx, sumBase, hl, fanout.Config{
-			Mechanism:        "tsm",
-			Variant:          "avg-sum",
-			ConcurrencyLimit: limit,
-			MaxCaptureBytes:  h.maxCaptureBytes,
-			Resources:        resourcesFn,
-			OnResult: func(i int, fr *fanout.Result) {
-				if fr.Failed || fr.Request == nil || fr.Capture == nil {
-					results[i].failed = true
-					return
-				}
-				rsc2 := request.GetResources(fr.Request)
-				if rsc2 == nil {
-					results[i].failed = true
-					return
-				}
-				if len(stripKeys) > 0 && rsc2.TS != nil {
-					if ds, ok := rsc2.TS.(*dataset.DataSet); ok {
-						ds.StripTags(stripKeys)
-					}
-				}
-				if rsc2.MergeFunc != nil && rsc2.TS != nil {
-					rsc2.MergeFunc(sumAccum, rsc2.TS, i)
-				}
-				sc := fr.Capture.StatusCode()
-				if rsc2.Response != nil && rsc2.Response.StatusCode > 0 {
-					sc = rsc2.Response.StatusCode
-				}
-				results[i] = gatherResult{
-					statusCode: sc,
-					header:     fr.Capture.Header(),
-					mergeFunc:  rsc2.MergeRespondFunc,
-				}
-			},
-		})
-		return err
-	})
-	eg.Go(func() error {
-		_, err := fanout.All(parentCtx, countBase, hl, fanout.Config{
-			Mechanism:        "tsm",
-			Variant:          "avg-count",
-			ConcurrencyLimit: limit,
-			MaxCaptureBytes:  h.maxCaptureBytes,
-			Resources:        resourcesFn,
-			OnResult: func(i int, fr *fanout.Result) {
-				// Count-side intentionally does not touch results[i]: the
-				// sum-side owns the response envelope. Panics in this slot
-				// are already recovered + countered by fanout.All.
-				if fr.Failed || fr.Request == nil {
-					return
-				}
-				rsc2 := request.GetResources(fr.Request)
-				if rsc2 == nil {
-					return
-				}
-				if len(stripKeys) > 0 && rsc2.TS != nil {
-					if ds, ok := rsc2.TS.(*dataset.DataSet); ok {
-						ds.StripTags(stripKeys)
-					}
-				}
-				if rsc2.MergeFunc != nil && rsc2.TS != nil {
-					rsc2.MergeFunc(countAccum, rsc2.TS, i)
-				}
-			},
-		})
-		return err
-	})
-	if err := eg.Wait(); err != nil {
-		logger.Warn("tsm avg gather failure", logging.Pairs{"error": err})
-	}
-
-	// Finalize: divide sum totals by count totals to obtain the weighted
-	// average. If either side fanned out to zero usable responses the
-	// surviving accumulator is unfinalized and not a true average — surface
-	// that to the client via a Prometheus warning rather than returning
-	// silently-wrong numbers (D2).
-	sumTS := sumAccum.GetTSData()
-	countTS := countAccum.GetTSData()
-	const (
-		warnCountFailed = "trickster: weighted-avg count fanout returned no usable responses; values are unfinalized sums and not a true average"
-		warnSumFailed   = "trickster: weighted-avg sum fanout returned no usable responses; values are unfinalized counts and not a true average"
-	)
-	switch {
-	case sumTS != nil && countTS != nil:
-		if sumDS, ok := sumTS.(*dataset.DataSet); ok {
-			if countDS, ok := countTS.(*dataset.DataSet); ok {
-				sumDS.FinalizeWeightedAvg(countDS, query)
+		set := make(map[dataset.Hash]struct{}, len(r.SeriesList))
+		countSeries[r.StatementID] = set
+		for _, s := range r.SeriesList {
+			if s == nil {
+				continue
 			}
+			set[pairingHash(&s.Header)] = struct{}{}
 		}
-	case sumTS != nil && countTS == nil:
-		if sumDS, ok := sumTS.(*dataset.DataSet); ok {
-			sumDS.Warnings = append(sumDS.Warnings, warnCountFailed)
+	}
+	var dropped []string
+	sumDS.UpdateLock.Lock()
+	for _, r := range sumDS.Results {
+		if r == nil {
+			continue
 		}
-	case sumTS == nil && countTS != nil:
-		// Promote countTS into the response slot so the client sees a body
-		// (with a warning) instead of nothing. The sum-side mrf still
-		// writes — it just marshals whichever DataSet the accumulator now
-		// holds.
-		if countDS, ok := countTS.(*dataset.DataSet); ok {
-			countDS.Warnings = append(countDS.Warnings, warnSumFailed)
+		set := countSeries[r.StatementID]
+		kept := r.SeriesList[:0]
+		for _, s := range r.SeriesList {
+			if s == nil {
+				continue
+			}
+			if _, ok := set[pairingHash(&s.Header)]; !ok {
+				dropped = append(dropped, s.Header.Name)
+				continue
+			}
+			kept = append(kept, s)
 		}
-		sumAccum.SetTSData(countTS)
+		r.SeriesList = kept
 	}
-
-	// Aggregate status and headers from sum-query results (count results are
-	// only used for the arithmetic and do not affect the response envelope).
-	mrf, winnerHeaders := pickWinner(results)
-	statusCode, statusHeader, has2xx, hasNon2xx := aggregateStatus(results)
-	if has2xx && hasNon2xx {
-		statusHeader = headers.MergeResultHeaderVals(statusHeader, "engine=ALB; status=phit")
+	if len(dropped) > 0 {
+		sumDS.Warnings = append(sumDS.Warnings,
+			"trickster: weighted-avg dropped "+strconv.Itoa(len(dropped))+
+				" series with no matching count side: "+strings.Join(dropped, ","))
 	}
-
-	// See serveStandard for the rationale -- carry the winner's custom
-	// response headers through the fanout so backend-set headers like
-	// `X-Test-Origin` survive the merge. (#970)
-	mergeMultiValuedHeaders(w.Header(), results, winnerHeaders)
-	if winnerHeaders != nil {
-		headers.Merge(w.Header(), winnerHeaders)
-	}
-
-	if statusHeader != "" {
-		w.Header().Set(headers.NameTricksterResult, statusHeader)
-	}
-
-	if statusCode == 0 {
-		statusCode = http.StatusOK
-	}
-	// Write the finalized sum accumulator (which now contains weighted averages)
-	// using the RespondFunc from the sum queries.
-	if mrf != nil {
-		mrf(w, r, sumAccum, statusCode)
-	}
+	sumDS.UpdateLock.Unlock()
 }
